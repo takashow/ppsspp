@@ -7,6 +7,7 @@
 #include "Common/Log.h"
 #include "Common/StringUtils.h"
 #include "../Globals.h"
+#include "Windows/DSoundStream.h"
 #include "Windows/EmuThread.h"
 #include "Windows/WndMainWindow.h"
 #include "Windows/resource.h"
@@ -81,6 +82,14 @@ bool EmuThread_Ready()
 	return emuThreadReady == THREAD_CORE_LOOP;
 }
 
+int Win32Mix(short *buffer, int numSamples, int bits, int rate, int channels) {
+	int retval = NativeMix(buffer, numSamples);
+#ifdef _WIN32
+	DSound::DSound_UpdateSound();
+#endif
+	return retval;
+}
+
 unsigned int WINAPI TheThread(void *)
 {
 	_InterlockedExchange(&emuThreadReady, THREAD_INIT);
@@ -136,6 +145,9 @@ unsigned int WINAPI TheThread(void *)
 	}
 
 	NativeInitGraphics();
+
+	DSound::DSound_StartSound(MainWindow::GetHWND(), &Win32Mix);
+
 	NativeResized();
 
 	INFO_LOG(BOOT, "Done.");
@@ -165,7 +177,9 @@ unsigned int WINAPI TheThread(void *)
 
 shutdown:
 	_InterlockedExchange(&emuThreadReady, THREAD_SHUTDOWN);
-
+#ifdef _WIN32
+	DSound::DSound_StopSound();
+#endif
 	NativeShutdownGraphics();
 
 	host->ShutdownSound();

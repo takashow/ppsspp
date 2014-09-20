@@ -163,12 +163,6 @@ public:
 	}
 };
 
-#ifdef _WIN32
-int Win32Mix(short *buffer, int numSamples, int bits, int rate, int channels) {
-	return NativeMix(buffer, numSamples);
-}
-#endif
-
 // globals
 PMixer *g_mixer = 0;
 #ifndef _WIN32
@@ -226,11 +220,6 @@ int NativeMix(short *audio, int num_samples) {
 		MixBackgroundAudio(audio, num_samples);
 		// memset(audio, 0, num_samples * 2 * sizeof(short));
 	}
-
-#ifdef _WIN32
-	DSound::DSound_UpdateSound();
-#endif
-
 	return num_samples;
 }
 
@@ -558,16 +547,9 @@ void NativeInitGraphics() {
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
 
-#ifdef _WIN32
-	DSound::DSound_StartSound(MainWindow::GetHWND(), &Win32Mix);
-#endif
 }
 
 void NativeShutdownGraphics() {
-#ifdef _WIN32
-	DSound::DSound_StopSound();
-#endif
-
 	screenManager->deviceLost();
 
 	g_gameInfoCache.Clear();
