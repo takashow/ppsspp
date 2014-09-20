@@ -3,18 +3,48 @@
 
 #include "Common/CommonWindows.h"
 
-namespace DSound
-{
-	typedef int (*StreamCallback)(short *buffer, int numSamples, int bits, int rate, int channels);
+namespace WinAudio {
 
-	bool DSound_StartSound(HWND window, StreamCallback _callback);
-	void DSound_UpdateSound();
-	void DSound_StopSound();
+	enum AudioSampleFormat {
+		FMT_S16,
+		FMT_FLOAT32,
+	};
 
-	float DSound_GetTimer();
-	int DSound_GetCurSample();
-	int DSound_GetSampleRate();
-}
+	struct AudioFormat {
+		int sampleRateHz;
+		int numChannels;
+		AudioSampleFormat sampleFormat;
+	};
+
+	typedef int(*StreamCallback)(short *buffer, int numSamples, int bits, int rate, int channels);
+
+	class AudioBackend {
+	public:
+		virtual ~AudioBackend() {}
+
+		virtual bool StartSound(HWND window, StreamCallback _callback) = 0;
+		virtual void UpdateSound() {}
+		virtual void StopSound() = 0;
+
+		virtual void GetAudioFormat(AudioFormat *fmt) = 0;
+	};
+
+	class DSound : public AudioBackend {
+	public:
+		bool StartSound(HWND window, StreamCallback _callback);
+		void UpdateSound();
+		void StopSound();
+
+		virtual void GetAudioFormat(AudioFormat *fmt);
+
+	private:
+		void soundThread();
+		static unsigned int WINAPI soundThreadTrampoline(void *);
+
+		StreamCallback callback;
+	};
+
+}  // namespace
 
  
 #endif //__SOUNDSTREAM_H__

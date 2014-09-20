@@ -28,6 +28,8 @@ static recursive_mutex emuThreadLock;
 static HANDLE emuThread;
 static volatile long emuThreadReady;
 
+WinAudio::AudioBackend *audioBackend = nullptr;
+
 extern std::vector<std::wstring> GetWideCmdLine();
 
 enum EmuThreadStatus : long
@@ -82,10 +84,14 @@ bool EmuThread_Ready()
 	return emuThreadReady == THREAD_CORE_LOOP;
 }
 
+void EmuThread_UpdateSound() {
+	audioBackend->UpdateSound();
+}
+
 int Win32Mix(short *buffer, int numSamples, int bits, int rate, int channels) {
 	int retval = NativeMix(buffer, numSamples);
 #ifdef _WIN32
-	DSound::DSound_UpdateSound();
+	audioBackend->UpdateSound();
 #endif
 	return retval;
 }
@@ -146,7 +152,8 @@ unsigned int WINAPI TheThread(void *)
 
 	NativeInitGraphics();
 
-	DSound::DSound_StartSound(MainWindow::GetHWND(), &Win32Mix);
+	audioBackend = new WinAudio::DSound();
+	audioBackend->StartSound(MainWindow::GetHWND(), &Win32Mix);
 
 	NativeResized();
 
@@ -178,7 +185,8 @@ unsigned int WINAPI TheThread(void *)
 shutdown:
 	_InterlockedExchange(&emuThreadReady, THREAD_SHUTDOWN);
 #ifdef _WIN32
-	DSound::DSound_StopSound();
+	audioBackend->StopSound();
+	delete audioBackend;
 #endif
 	NativeShutdownGraphics();
 

@@ -20,3 +20,6 @@
 void EmuThread_Start();
 void EmuThread_Stop();
 bool EmuThread_Ready();
+
+// TODO: Get rid of this.
+void EmuThread_UpdateSound();

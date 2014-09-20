@@ -131,7 +131,7 @@ void WindowsHost::InitSound(PMixer *mixer)
 
 void WindowsHost::UpdateSound()
 {
-	DSound::DSound_UpdateSound();
+	EmuThread_UpdateSound();
 }
 
 void WindowsHost::ShutdownSound()
