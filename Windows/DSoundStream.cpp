@@ -6,49 +6,25 @@
 
 namespace WinAudio
 {
-#define BUFSIZE 0x4000
-#define MAXWAIT 20   //ms
-
-	int currentPos;
-	int lastPos;
-	short realtimeBuffer[BUFSIZE * 2];
-
-	CRITICAL_SECTION soundCriticalSection;
-	HANDLE soundSyncEvent = NULL;
-	HANDLE hThread = NULL;
-
-	IDirectSound8 *ds = NULL;
-	IDirectSoundBuffer *dsBuffer = NULL;
-
-	int bufferSize; // bytes
-	int totalRenderedBytes;
-	int sampleRate;
-
-	volatile int threadData;
-
-	inline int RoundDown128(int x) {
-		return x & (~127);
-	}
-
-	void DSound::GetAudioFormat(AudioFormat *fmt) {
-		fmt->sampleRateHz = sampleRate;
-		fmt->numChannels = 2;
-		fmt->sampleFormat = FMT_S16;
-	}
-
-	bool createBuffer() {
+	bool DSound::createBuffer(const AudioFormat &format) {
 		PCMWAVEFORMAT pcmwf; 
 		DSBUFFERDESC dsbdesc; 
+
+		// No support for float audio here.
+		if (format.sampleFormat != FMT_S16) {
+			return false;
+		}
+		format_ = format;
 
 		memset(&pcmwf, 0, sizeof(PCMWAVEFORMAT)); 
 		memset(&dsbdesc, 0, sizeof(DSBUFFERDESC)); 
 
 		pcmwf.wf.wFormatTag = WAVE_FORMAT_PCM; 
-		pcmwf.wf.nChannels = 2; 
-		pcmwf.wf.nSamplesPerSec = sampleRate = 44100; 
+		pcmwf.wf.nChannels = format.numChannels;
+		pcmwf.wf.nSamplesPerSec = format.sampleRateHz;
 		pcmwf.wf.nBlockAlign = 4; 
 		pcmwf.wf.nAvgBytesPerSec = pcmwf.wf.nSamplesPerSec * pcmwf.wf.nBlockAlign; 
-		pcmwf.wBitsPerSample = 16; 
+		pcmwf.wBitsPerSample = 16;
 
 		dsbdesc.dwSize = sizeof(DSBUFFERDESC); 
 		dsbdesc.dwFlags = DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS; // //DSBCAPS_CTRLPAN | DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLFREQUENCY; 
@@ -64,9 +40,7 @@ namespace WinAudio
 		} 
 	}
 
-	bool writeDataToBuffer(DWORD dwOffset, // Our own write cursor.
-												 char* soundData, // Start of our data.
-												 DWORD dwSoundBytes) {// Size of block to copy.
+	bool DSound::writeDataToBuffer(DWORD dwOffset, char* soundData, DWORD dwSoundBytes) {
 		void *ptr1, *ptr2;
 		DWORD numBytes1, numBytes2; 
 		// Obtain memory address of write block. This will be in two parts if the block wraps around.
@@ -81,10 +55,6 @@ namespace WinAudio
 		return false; 
 	} 
 
-	inline int ModBufferSize(int x) {
-		return (x+bufferSize)%bufferSize;
-	}
-
 	void DSound::soundThread() {
 		setCurrentThreadName("DSound");
 		currentPos = 0;
@@ -98,7 +68,7 @@ namespace WinAudio
 			dsBuffer->GetCurrentPosition((DWORD *)&currentPos, 0);
 			int numBytesToRender = RoundDown128(ModBufferSize(currentPos - lastPos));
 			if (numBytesToRender >= 256) {
-				int numBytesRendered = 4 * (*callback)(realtimeBuffer, numBytesToRender >> 2, 16, 44100, 2);
+				int numBytesRendered = 4 * (*callback)(realtimeBuffer, numBytesToRender >> 2, 16, format_.sampleRateHz, format_.numChannels);
 				//We need to copy the full buffer, regardless of what the mixer claims to have filled
 				//If we don't do this then the sound will loop if the sound stops and the mixer writes only zeroes
 				numBytesRendered = numBytesToRender;
@@ -124,7 +94,7 @@ namespace WinAudio
 		return 0;
 	}
 
-	bool DSound::StartSound(HWND window, StreamCallback _callback) {
+	bool DSound::StartSound(HWND window, const AudioFormat &format, StreamCallback _callback) {
 		callback = _callback;
 		threadData=0;
 
@@ -135,7 +105,7 @@ namespace WinAudio
 			return false;
 
 		ds->SetCooperativeLevel(window,DSSCL_PRIORITY);
-		if (!createBuffer())
+		if (!createBuffer(format))
 			return false;
 
 		DWORD num1;

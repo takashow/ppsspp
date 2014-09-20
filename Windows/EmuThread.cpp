@@ -152,8 +152,13 @@ unsigned int WINAPI TheThread(void *)
 
 	NativeInitGraphics();
 
+	WinAudio::AudioFormat afmt;
+	afmt.numChannels = 2;
+	afmt.sampleFormat = WinAudio::FMT_S16;
+	afmt.sampleRateHz = 44100;
+
 	audioBackend = new WinAudio::DSound();
-	audioBackend->StartSound(MainWindow::GetHWND(), &Win32Mix);
+	audioBackend->StartSound(MainWindow::GetHWND(), afmt, &Win32Mix);
 
 	NativeResized();
 
