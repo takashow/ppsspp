@@ -155,7 +155,7 @@ unsigned int WINAPI TheThread(void *)
 	afmt.sampleRateHz = 44100;
 
 	// First try to create an XAudio2 backend.
-	// audioBackend = new WinAudio::XAudio2();
+	audioBackend = new WinAudio::XAudio2();
 	if (!audioBackend || !audioBackend->IsOKToStart()) {
 		delete audioBackend;
 		// DSound pretty much always works.

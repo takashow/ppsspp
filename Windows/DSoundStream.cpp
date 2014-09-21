@@ -157,7 +157,7 @@ namespace WinAudio
 		LeaveCriticalSection(&soundCriticalSection);
 	}
 
-	typedef HRESULT (*XAudio2CreateFunc)(IXAudio2** ppXAudio2, UINT32 Flags, XAUDIO2_PROCESSOR XAudio2Processor);
+	typedef HRESULT(__stdcall *XAudio2CreateFunc)(IXAudio2** ppXAudio2, UINT32 Flags, XAUDIO2_PROCESSOR XAudio2Processor);
 
 	struct XA2State {
 		IXAudio2 *xaudio2_;
@@ -176,14 +176,15 @@ namespace WinAudio
 		for (int i = 0; i < bufferCount_; i++) {
 			buffers_[i] = new short[audioBufferSize_];
 		}
-		// Grab the pointer to the CREATE function.
+		CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+		// Grab the pointer to the XAudio2Create function.
 		library_ = LoadLibrary(L"xaudio2_8.dll");
 		if (library_) {
 			create_ = GetProcAddress(library_, "XAudio2Create");
 		} else {
 			create_ = NULL;
 		}
-		CoInitializeEx(NULL, COINIT_MULTITHREADED);
 	}
 
 	XAudio2::~XAudio2() {
@@ -207,15 +208,16 @@ namespace WinAudio
 		XAudio2CreateFunc func = (XAudio2CreateFunc)create_;
 
 		// For some reason, when loading the func dynamically, voices don't get created later (but still return S_OK?)
-		//HRESULT result = func(&xa2_->xaudio2_, 0, XAUDIO2_DEFAULT_PROCESSOR);
+		/// HRESULT result = func(&xa2_->xaudio2_, 0, XAUDIO2_DEFAULT_PROCESSOR);
+
+		// This states that loading dynamically should work:
+		// http://blogs.msdn.com/b/chuckw/archive/2012/04/02/xaudio2-and-windows-8-consumer-preview.aspx
 
 		HRESULT result = XAudio2Create(&xa2_->xaudio2_, 0, XAUDIO2_DEFAULT_PROCESSOR);
 		if (FAILED(result)) {
 			return false;
 		}
 
-		xa2_->masteringVoice_ = nullptr;
-		xa2_->sourceVoice_ = nullptr;
 		result = xa2_->xaudio2_->CreateMasteringVoice(&xa2_->masteringVoice_);
 		if (FAILED(result)) {
 			xa2_->xaudio2_->Release();
@@ -241,7 +243,6 @@ namespace WinAudio
 
 		return true;
 	}
-
 
 	// TODO: Try pushing buffers of whatever size the PSP gives us directly from the PSP APIs instead of pulling. Would let us
 	// get rid of one audio queue, now we really have two...
