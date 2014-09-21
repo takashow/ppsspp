@@ -29,13 +29,15 @@ namespace WinAudio {
 		virtual bool StartSound(HWND window, const AudioFormat &format, StreamCallback _callback) = 0;
 		virtual void UpdateSound() {}
 		virtual void StopSound() = 0;
+		virtual bool IsOKToStart() = 0;
 	};
 
 	class DSound : public AudioBackend {
 	public:
-		bool StartSound(HWND window, const AudioFormat &format, StreamCallback _callback);
-		void UpdateSound();
-		void StopSound();
+		bool StartSound(HWND window, const AudioFormat &format, StreamCallback _callback) override;
+		void UpdateSound() override;
+		void StopSound() override;
+		bool IsOKToStart() override { return true; }
 
 	private:
 		void soundThread();
@@ -74,6 +76,34 @@ namespace WinAudio {
 			return x & (~127);
 		}
 	};
+
+	struct XA2State;
+
+	class XAudio2 : public AudioBackend {
+	public:
+		XAudio2();
+		~XAudio2();
+		bool StartSound(HWND window, const AudioFormat &format, StreamCallback callback) override;
+		void UpdateSound() override;
+		void StopSound() override;
+		bool IsOKToStart() override { return create_ != nullptr; }
+
+	private:
+		int currentBuffer_;
+		int audioBufferSize_;
+		int bufferCount_;
+		bool started_;
+		short **buffers_;
+
+		XA2State *xa2_;
+
+		AudioFormat format_;
+		StreamCallback callback_;
+
+		HMODULE library_;
+		void *create_;
+	};
+
 
 }  // namespace
 

@@ -36,6 +36,7 @@
 #include "Windows/D3D9Base.h"
 #endif
 #include "Windows/InputDevice.h"
+#include "Windows/EmuThread.h"
 #endif
 
 #include "Host.h"
@@ -172,6 +173,7 @@ void Core_RunLoop() {
 #if defined(USING_WIN_UI)
 		double startTime = time_now_d();
 		UpdateRunLoop();
+		EmuThread_UpdateSound();
 
 		// Simple throttling to not burn the GPU in the menu.
 		time_update();

@@ -1,6 +1,7 @@
 #include "native/thread/threadutil.h"
 #include "Common/CommonWindows.h"
 #include <dsound.h>
+#include <XAudio2.h>
 
 #include "dsoundstream.h"	
 
@@ -155,4 +156,135 @@ namespace WinAudio
 		soundSyncEvent = NULL;
 		LeaveCriticalSection(&soundCriticalSection);
 	}
+
+	typedef HRESULT (*XAudio2CreateFunc)(IXAudio2** ppXAudio2, UINT32 Flags, XAUDIO2_PROCESSOR XAudio2Processor);
+
+	struct XA2State {
+		IXAudio2 *xaudio2_;
+		IXAudio2MasteringVoice *masteringVoice_;
+		IXAudio2SourceVoice *sourceVoice_;
+	};
+
+	XAudio2::XAudio2() {
+		// TODO: Tweak the buffers.
+		audioBufferSize_ = 1024;
+		bufferCount_ = 4;
+		currentBuffer_ = 0;
+		buffers_ = new short*[bufferCount_];
+		xa2_ = new XA2State();
+		memset(xa2_, 0, sizeof(*xa2_));
+		for (int i = 0; i < bufferCount_; i++) {
+			buffers_[i] = new short[audioBufferSize_];
+		}
+		// Grab the pointer to the CREATE function.
+		library_ = LoadLibrary(L"xaudio2_8.dll");
+		if (library_) {
+			create_ = GetProcAddress(library_, "XAudio2Create");
+		} else {
+			create_ = NULL;
+		}
+		CoInitializeEx(NULL, COINIT_MULTITHREADED);
+	}
+
+	XAudio2::~XAudio2() {
+		delete xa2_;
+		for (int i = 0; i < bufferCount_; i++) {
+			delete[] buffers_[i];
+		}
+		delete[] buffers_;
+		FreeLibrary(library_);
+		CoUninitialize();
+	}
+
+	bool XAudio2::StartSound(HWND window, const AudioFormat &format, StreamCallback callback) {
+		if (!create_)
+			return false;
+
+		callback_ = callback;
+		format_ = format;
+		started_ = false;
+
+		XAudio2CreateFunc func = (XAudio2CreateFunc)create_;
+
+		// For some reason, when loading the func dynamically, voices don't get created later (but still return S_OK?)
+		//HRESULT result = func(&xa2_->xaudio2_, 0, XAUDIO2_DEFAULT_PROCESSOR);
+
+		HRESULT result = XAudio2Create(&xa2_->xaudio2_, 0, XAUDIO2_DEFAULT_PROCESSOR);
+		if (FAILED(result)) {
+			return false;
+		}
+
+		xa2_->masteringVoice_ = nullptr;
+		xa2_->sourceVoice_ = nullptr;
+		result = xa2_->xaudio2_->CreateMasteringVoice(&xa2_->masteringVoice_);
+		if (FAILED(result)) {
+			xa2_->xaudio2_->Release();
+			return false;
+		}
+
+		WAVEFORMATEX fmt;
+		fmt.cbSize = sizeof(fmt);
+		fmt.nChannels = format.numChannels;
+		fmt.nSamplesPerSec = format.sampleRateHz;
+		fmt.wBitsPerSample = 16;
+		fmt.nBlockAlign = sizeof(short) * format.numChannels;
+		fmt.wFormatTag = 1;
+		fmt.nAvgBytesPerSec = fmt.nBlockAlign * fmt.nSamplesPerSec;
+		result = xa2_->xaudio2_->CreateSourceVoice(&xa2_->sourceVoice_, &fmt, 0, 2.0f, 0, 0, 0);
+		if (FAILED(result)) {
+			xa2_->masteringVoice_->DestroyVoice();
+			xa2_->masteringVoice_ = nullptr;
+			xa2_->xaudio2_->Release();
+			xa2_->xaudio2_ = nullptr;
+			return false;
+		}
+
+		return true;
+	}
+
+
+	// TODO: Try pushing buffers of whatever size the PSP gives us directly from the PSP APIs instead of pulling. Would let us
+	// get rid of one audio queue, now we really have two...
+	void XAudio2::UpdateSound() {
+		// Find the current state of the playing buffers
+		XAUDIO2_VOICE_STATE state;
+		xa2_->sourceVoice_->GetState(&state);
+
+		// Have any of the buffer completed
+		while (state.BuffersQueued < bufferCount_) {
+			// Generate a new buffer of data.
+			callback_(buffers_[currentBuffer_], audioBufferSize_ / 2, 16, format_.sampleRateHz, format_.numChannels);
+
+			// Submit the new buffer
+			XAUDIO2_BUFFER buf = { 0 };
+			buf.AudioBytes = sizeof(short) * audioBufferSize_;
+			buf.pAudioData = (BYTE *)buffers_[currentBuffer_];
+			HRESULT result = xa2_->sourceVoice_->SubmitSourceBuffer(&buf);
+
+			if (!started_) {
+				xa2_->sourceVoice_->Start(0, XAUDIO2_COMMIT_NOW);
+				started_ = true;
+			}
+
+			// Advance the buffer index
+			currentBuffer_ = ++currentBuffer_ % bufferCount_;
+
+			// Get the updated state
+			xa2_->sourceVoice_->GetState(&state);
+		}
+	}
+
+	void XAudio2::StopSound() {
+		// Submit a final buffer to avoid counting a glitch.
+		XAUDIO2_BUFFER buf = { 0 };
+		buf.AudioBytes = NULL;
+		buf.Flags = XAUDIO2_END_OF_STREAM;
+		xa2_->sourceVoice_->SubmitSourceBuffer(&buf);
+		xa2_->sourceVoice_->DestroyVoice();
+		xa2_->masteringVoice_->DestroyVoice();
+		xa2_->xaudio2_->Release();
+		memset(xa2_, 0, sizeof(*xa2_));
+		started_ = false;
+	}
+
 }

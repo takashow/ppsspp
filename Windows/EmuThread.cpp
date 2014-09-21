@@ -90,9 +90,6 @@ void EmuThread_UpdateSound() {
 
 int Win32Mix(short *buffer, int numSamples, int bits, int rate, int channels) {
 	int retval = NativeMix(buffer, numSamples);
-#ifdef _WIN32
-	audioBackend->UpdateSound();
-#endif
 	return retval;
 }
 
@@ -157,7 +154,14 @@ unsigned int WINAPI TheThread(void *)
 	afmt.sampleFormat = WinAudio::FMT_S16;
 	afmt.sampleRateHz = 44100;
 
-	audioBackend = new WinAudio::DSound();
+	// First try to create an XAudio2 backend.
+	// audioBackend = new WinAudio::XAudio2();
+	if (!audioBackend || !audioBackend->IsOKToStart()) {
+		delete audioBackend;
+		// DSound pretty much always works.
+		audioBackend = new WinAudio::DSound();
+	}
+
 	audioBackend->StartSound(MainWindow::GetHWND(), afmt, &Win32Mix);
 
 	NativeResized();
