@@ -15,6 +15,10 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include "ppsspp_config.h"
+
+#if PPSSPP_ARCH(X86) || PPSSPP_ARCH(AMD64)
+
 #include "Core/Config.h"
 #include "Core/Debugger/Breakpoints.h"
 #include "Core/MemMap.h"
@@ -25,6 +29,8 @@
 
 namespace MIPSComp
 {
+using namespace Gen;
+using namespace X64JitConstants;
 
 void JitMemCheck(u32 addr, int size, int isWrite)
 {
@@ -47,20 +53,19 @@ void JitMemCheckCleanup()
 JitSafeMem::JitSafeMem(Jit *jit, MIPSGPReg raddr, s32 offset, u32 alignMask)
 	: jit_(jit), raddr_(raddr), offset_(offset), needsCheck_(false), needsSkip_(false), alignMask_(alignMask)
 {
-	// This makes it more instructions, so let's play it safe and say we need a far jump.
-	far_ = !g_Config.bIgnoreBadMemAccess || !CBreakPoints::GetMemChecks().empty();
+	// Mask out the kernel RAM bit, because we'll end up with a negative offset to MEMBASEREG.
 	if (jit_->gpr.IsImm(raddr_))
-		iaddr_ = jit_->gpr.GetImm(raddr_) + offset_;
+		iaddr_ = (jit_->gpr.GetImm(raddr_) + offset_) & 0x7FFFFFFF;
 	else
 		iaddr_ = (u32) -1;
 
 	fast_ = g_Config.bFastMemory || raddr == MIPS_REG_SP;
-}
 
-void JitSafeMem::SetFar()
-{
-	_dbg_assert_msg_(JIT, !needsSkip_, "Sorry, you need to call SetFar() earlier.");
-	far_ = true;
+	// If raddr_ is going to get loaded soon, load it now for more optimal code.
+	// We assume that it was already locked.
+	const int LOOKAHEAD_OPS = 3;
+	if (!jit_->gpr.R(raddr_).IsImm() && MIPSAnalyst::IsRegisterUsed(raddr_, jit_->GetCompilerPC() + 4, LOOKAHEAD_OPS))
+		jit_->gpr.MapReg(raddr_, true, false);
 }
 
 bool JitSafeMem::PrepareWrite(OpArg &dest, int size)
@@ -72,11 +77,15 @@ bool JitSafeMem::PrepareWrite(OpArg &dest, int size)
 		if (ImmValid())
 		{
 			MemCheckImm(MEM_WRITE);
+			u32 addr = (iaddr_ & alignMask_);
+#ifdef MASKED_PSP_MEMORY
+			addr &= Memory::MEMVIEW32_MASK;
+#endif
 
-#ifdef _M_IX86
-			dest = M(Memory::base + (iaddr_ & Memory::MEMVIEW32_MASK & alignMask_));
+#if PPSSPP_ARCH(32BIT)
+			dest = M(Memory::base + addr);  // 32-bit only
 #else
-			dest = MDisp(RBX, iaddr_ & alignMask_);
+			dest = MDisp(MEMBASEREG, addr);
 #endif
 			return true;
 		}
@@ -97,11 +106,15 @@ bool JitSafeMem::PrepareRead(OpArg &src, int size)
 		if (ImmValid())
 		{
 			MemCheckImm(MEM_READ);
+			u32 addr = (iaddr_ & alignMask_);
+#ifdef MASKED_PSP_MEMORY
+			addr &= Memory::MEMVIEW32_MASK;
+#endif
 
-#ifdef _M_IX86
-			src = M(Memory::base + (iaddr_ & Memory::MEMVIEW32_MASK & alignMask_));
+#if PPSSPP_ARCH(32BIT)
+			src = M(Memory::base + addr);  // 32-bit only
 #else
-			src = MDisp(RBX, iaddr_ & alignMask_);
+			src = MDisp(MEMBASEREG, addr);
 #endif
 			return true;
 		}
@@ -115,33 +128,38 @@ bool JitSafeMem::PrepareRead(OpArg &src, int size)
 
 OpArg JitSafeMem::NextFastAddress(int suboffset)
 {
-	if (jit_->gpr.IsImm(raddr_))
+	if (iaddr_ != (u32) -1)
 	{
-		u32 addr = (jit_->gpr.GetImm(raddr_) + offset_ + suboffset) & alignMask_;
+		u32 addr = (iaddr_ + suboffset) & alignMask_;
+#ifdef MASKED_PSP_MEMORY
+		addr &= Memory::MEMVIEW32_MASK;
+#endif
 
-#ifdef _M_IX86
-		return M(Memory::base + (addr & Memory::MEMVIEW32_MASK));
+#if PPSSPP_ARCH(32BIT)
+		return M(Memory::base + addr);  // 32-bit only
 #else
-		return MDisp(RBX, addr);
+		return MDisp(MEMBASEREG, addr);
 #endif
 	}
 
 	_dbg_assert_msg_(JIT, (suboffset & alignMask_) == suboffset, "suboffset must be aligned");
 
-#ifdef _M_IX86
+#if PPSSPP_ARCH(32BIT)
 	return MDisp(xaddr_, (u32) Memory::base + offset_ + suboffset);
 #else
-	return MComplex(RBX, xaddr_, SCALE_1, offset_ + suboffset);
+	return MComplex(MEMBASEREG, xaddr_, SCALE_1, offset_ + suboffset);
 #endif
 }
 
-OpArg JitSafeMem::PrepareMemoryOpArg(ReadType type)
+OpArg JitSafeMem::PrepareMemoryOpArg(MemoryOpType type)
 {
 	// We may not even need to move into EAX as a temporary.
 	bool needTemp = alignMask_ != 0xFFFFFFFF;
-#ifdef _M_IX86
+
+#ifdef MASKED_PSP_MEMORY
+	bool needMask = true; // raddr_ != MIPS_REG_SP;    // Commented out this speedhack due to low impact
 	// We always mask on 32 bit in fast memory mode.
-	needTemp = needTemp || fast_;
+	needTemp = needTemp || (fast_ && needMask);
 #endif
 
 	if (jit_->gpr.R(raddr_).IsSimpleReg() && !needTemp)
@@ -170,8 +188,10 @@ OpArg JitSafeMem::PrepareMemoryOpArg(ReadType type)
 	}
 	else
 	{
-#ifdef _M_IX86
-		jit_->AND(32, R(EAX), Imm32(Memory::MEMVIEW32_MASK));
+#ifdef MASKED_PSP_MEMORY
+		if (needMask) {
+			jit_->AND(32, R(EAX), Imm32(Memory::MEMVIEW32_MASK));
+		}
 #endif
 	}
 
@@ -184,17 +204,17 @@ OpArg JitSafeMem::PrepareMemoryOpArg(ReadType type)
 		jit_->SUB(32, R(xaddr_), Imm32(offset_));
 	}
 
-#ifdef _M_IX86
+#if PPSSPP_ARCH(32BIT)
 	return MDisp(xaddr_, (u32) Memory::base + offset_);
 #else
-	return MComplex(RBX, xaddr_, SCALE_1, offset_);
+	return MComplex(MEMBASEREG, xaddr_, SCALE_1, offset_);
 #endif
 }
 
 void JitSafeMem::PrepareSlowAccess()
 {
 	// Skip the fast path (which the caller wrote just now.)
-	skip_ = jit_->J(far_);
+	skip_ = jit_->J(true);
 	needsSkip_ = true;
 	jit_->SetJumpTarget(tooLow_);
 	jit_->SetJumpTarget(tooHigh_);
@@ -222,7 +242,7 @@ bool JitSafeMem::PrepareSlowWrite()
 		return false;
 }
 
-void JitSafeMem::DoSlowWrite(const void *safeFunc, const OpArg src, int suboffset)
+void JitSafeMem::DoSlowWrite(const void *safeFunc, const OpArg& src, int suboffset)
 {
 	if (iaddr_ != (u32) -1)
 		jit_->MOV(32, R(EAX), Imm32((iaddr_ + suboffset) & alignMask_));
@@ -233,18 +253,18 @@ void JitSafeMem::DoSlowWrite(const void *safeFunc, const OpArg src, int suboffse
 			jit_->AND(32, R(EAX), Imm32(alignMask_));
 	}
 
-#ifdef _M_IX86
+#if PPSSPP_ARCH(32BIT)
 	jit_->PUSH(EDX);
 #endif
 	if (!src.IsSimpleReg(EDX)) {
 		jit_->MOV(32, R(EDX), src);
 	}
 	if (!g_Config.bIgnoreBadMemAccess) {
-		jit_->MOV(32, M(&jit_->mips_->pc), Imm32(jit_->js.compilerPC));
+		jit_->MOV(32, MIPSSTATE_VAR(pc), Imm32(jit_->GetCompilerPC()));
 	}
 	// This is a special jit-ABI'd function.
 	jit_->CALL(safeFunc);
-#ifdef _M_IX86
+#if PPSSPP_ARCH(32BIT)
 	jit_->POP(EDX);
 #endif
 	needsCheck_ = true;
@@ -270,7 +290,7 @@ bool JitSafeMem::PrepareSlowRead(const void *safeFunc)
 		}
 
 		if (!g_Config.bIgnoreBadMemAccess) {
-			jit_->MOV(32, M(&jit_->mips_->pc), Imm32(jit_->js.compilerPC));
+			jit_->MOV(32, MIPSSTATE_VAR(pc), Imm32(jit_->GetCompilerPC()));
 		}
 		// This is a special jit-ABI'd function.
 		jit_->CALL(safeFunc);
@@ -304,7 +324,7 @@ void JitSafeMem::NextSlowRead(const void *safeFunc, int suboffset)
 	}
 
 	if (!g_Config.bIgnoreBadMemAccess) {
-		jit_->MOV(32, M(&jit_->mips_->pc), Imm32(jit_->js.compilerPC));
+		jit_->MOV(32, MIPSSTATE_VAR(pc), Imm32(jit_->GetCompilerPC()));
 	}
 	// This is a special jit-ABI'd function.
 	jit_->CALL(safeFunc);
@@ -326,7 +346,7 @@ void JitSafeMem::Finish()
 		jit_->SetJumpTarget(*it);
 }
 
-void JitSafeMem::MemCheckImm(ReadType type)
+void JitSafeMem::MemCheckImm(MemoryOpType type)
 {
 	MemCheck *check = CBreakPoints::GetMemCheck(iaddr_, size_);
 	if (check)
@@ -336,17 +356,25 @@ void JitSafeMem::MemCheckImm(ReadType type)
 		if (!(check->cond & MEMCHECK_WRITE) && type == MEM_WRITE)
 			return;
 
-		jit_->MOV(32, M(&jit_->mips_->pc), Imm32(jit_->js.compilerPC));
+		jit_->MOV(32, MIPSSTATE_VAR(pc), Imm32(jit_->GetCompilerPC()));
 		jit_->CallProtectedFunction(&JitMemCheck, iaddr_, size_, type == MEM_WRITE ? 1 : 0);
 
 		// CORE_RUNNING is <= CORE_NEXTFRAME.
-		jit_->CMP(32, M(&coreState), Imm32(CORE_NEXTFRAME));
+		if (jit_->RipAccessible((const void *)&coreState)) {
+			jit_->CMP(32, M(&coreState), Imm32(CORE_NEXTFRAME));  // rip accessible
+		} else {
+			// We can't safely overwrite any register, so push.  This is only while debugging.
+			jit_->PUSH(RAX);
+			jit_->MOV(PTRBITS, R(RAX), ImmPtr((const void *)&coreState));
+			jit_->CMP(32, MatR(RAX), Imm32(CORE_NEXTFRAME));
+			jit_->POP(RAX);
+		}
 		skipChecks_.push_back(jit_->J_CC(CC_G, true));
 		jit_->js.afterOp |= JitState::AFTER_CORE_STATE | JitState::AFTER_REWIND_PC_BAD_STATE | JitState::AFTER_MEMCHECK_CLEANUP;
 	}
 }
 
-void JitSafeMem::MemCheckAsm(ReadType type)
+void JitSafeMem::MemCheckAsm(MemoryOpType type)
 {
 	const auto memchecks = CBreakPoints::GetMemCheckRanges();
 	bool possible = false;
@@ -376,7 +404,7 @@ void JitSafeMem::MemCheckAsm(ReadType type)
 		// Keep the stack 16-byte aligned, just PUSH/POP 4 times.
 		for (int i = 0; i < 4; ++i)
 			jit_->PUSH(xaddr_);
-		jit_->MOV(32, M(&jit_->mips_->pc), Imm32(jit_->js.compilerPC));
+		jit_->MOV(32, MIPSSTATE_VAR(pc), Imm32(jit_->GetCompilerPC()));
 		jit_->ADD(32, R(xaddr_), Imm32(offset_));
 		jit_->CallProtectedFunction(&JitMemCheck, R(xaddr_), size_, type == MEM_WRITE ? 1 : 0);
 		for (int i = 0; i < 4; ++i)
@@ -390,7 +418,15 @@ void JitSafeMem::MemCheckAsm(ReadType type)
 	if (possible)
 	{
 		// CORE_RUNNING is <= CORE_NEXTFRAME.
-		jit_->CMP(32, M(&coreState), Imm32(CORE_NEXTFRAME));
+		if (jit_->RipAccessible((const void *)&coreState)) {
+			jit_->CMP(32, M(&coreState), Imm32(CORE_NEXTFRAME));  // rip accessible
+		} else {
+			// We can't safely overwrite any register, so push.  This is only while debugging.
+			jit_->PUSH(RAX);
+			jit_->MOV(PTRBITS, R(RAX), ImmPtr((const void *)&coreState));
+			jit_->CMP(32, MatR(RAX), Imm32(CORE_NEXTFRAME));
+			jit_->POP(RAX);
+		}
 		skipChecks_.push_back(jit_->J_CC(CC_G, true));
 		jit_->js.afterOp |= JitState::AFTER_CORE_STATE | JitState::AFTER_REWIND_PC_BAD_STATE | JitState::AFTER_MEMCHECK_CLEANUP;
 	}
@@ -404,6 +440,7 @@ void JitSafeMemFuncs::Init(ThunkManager *thunks) {
 	AllocCodeSpace(FUNCS_ARENA_SIZE);
 	thunks_ = thunks;
 
+	BeginWrite();
 	readU32 = GetCodePtr();
 	CreateReadFunc(32, (const void *)&Memory::Read_U32);
 	readU16 = GetCodePtr();
@@ -417,10 +454,11 @@ void JitSafeMemFuncs::Init(ThunkManager *thunks) {
 	CreateWriteFunc(16, (const void *)&Memory::Write_U16);
 	writeU8 = GetCodePtr();
 	CreateWriteFunc(8, (const void *)&Memory::Write_U8);
+	EndWrite();
 }
 
 void JitSafeMemFuncs::Shutdown() {
-	ResetCodePtr();
+	ResetCodePtr(0);
 	FreeCodeSpace();
 }
 
@@ -433,7 +471,7 @@ void JitSafeMemFuncs::CreateReadFunc(int bits, const void *fallbackFunc) {
 	CheckDirectEAX();
 
 	// Since we were CALLed, we need to align the stack before calling C++.
-#ifdef _M_IX86
+#if PPSSPP_ARCH(32BIT)
 	SUB(32, R(ESP), Imm8(16 - 4));
 	ABI_CallFunctionA(thunks_->ProtectFunction(fallbackFunc, 1), R(EAX));
 	ADD(32, R(ESP), Imm8(16 - 4));
@@ -447,10 +485,10 @@ void JitSafeMemFuncs::CreateReadFunc(int bits, const void *fallbackFunc) {
 
 	StartDirectAccess();
 
-#ifdef _M_IX86
+#if PPSSPP_ARCH(32BIT)
 	MOVZX(32, bits, EAX, MDisp(EAX, (u32)Memory::base));
 #else
-	MOVZX(32, bits, EAX, MRegSum(RBX, EAX));
+	MOVZX(32, bits, EAX, MRegSum(MEMBASEREG, EAX));
 #endif
 
 	RET();
@@ -460,7 +498,7 @@ void JitSafeMemFuncs::CreateWriteFunc(int bits, const void *fallbackFunc) {
 	CheckDirectEAX();
 
 	// Since we were CALLed, we need to align the stack before calling C++.
-#ifdef _M_IX86
+#if PPSSPP_ARCH(32BIT)
 	// 4 for return, 4 for saved reg on stack.
 	SUB(32, R(ESP), Imm8(16 - 4 - 4));
 	ABI_CallFunctionAA(thunks_->ProtectFunction(fallbackFunc, 2), R(EDX), R(EAX));
@@ -475,10 +513,10 @@ void JitSafeMemFuncs::CreateWriteFunc(int bits, const void *fallbackFunc) {
 
 	StartDirectAccess();
 
-#ifdef _M_IX86
+#if PPSSPP_ARCH(32BIT)
 	MOV(bits, MDisp(EAX, (u32)Memory::base), R(EDX));
 #else
-	MOV(bits, MRegSum(RBX, EAX), R(EDX));
+	MOV(bits, MRegSum(MEMBASEREG, EAX), R(EDX));
 #endif
 
 	RET();
@@ -516,3 +554,5 @@ void JitSafeMemFuncs::StartDirectAccess() {
 }
 
 };
+
+#endif // PPSSPP_ARCH(X86) || PPSSPP_ARCH(AMD64)

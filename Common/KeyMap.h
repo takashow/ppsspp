@@ -21,6 +21,7 @@
 #include <map>
 #include <vector>
 #include <set>
+#include "input/input_state.h" // KeyDef
 #include "input/keycodes.h"     // keyboard keys
 #include "../Core/HLE/sceCtrl.h"   // psp keys
 
@@ -28,25 +29,29 @@
 #define KEYMAP_ERROR_UNKNOWN_KEY 0
 
 enum {
-	VIRTKEY_FIRST = 0x10000,
-	VIRTKEY_AXIS_X_MIN = 0x10000,
-	VIRTKEY_AXIS_Y_MIN = 0x10001,
-	VIRTKEY_AXIS_X_MAX = 0x10002,
-	VIRTKEY_AXIS_Y_MAX = 0x10003,
-	VIRTKEY_RAPID_FIRE = 0x10004,
-	VIRTKEY_UNTHROTTLE = 0x10005,
-	VIRTKEY_PAUSE = 0x10006,
-	VIRTKEY_SPEED_TOGGLE = 0x10007,
-	VIRTKEY_AXIS_RIGHT_X_MIN = 0x10008,
-	VIRTKEY_AXIS_RIGHT_Y_MIN = 0x10009,
-	VIRTKEY_AXIS_RIGHT_X_MAX = 0x1000a,
-	VIRTKEY_AXIS_RIGHT_Y_MAX = 0x1000b,
-	VIRTKEY_REWIND = 0x1000c,
-	VIRTKEY_SAVE_STATE = 0x1000d,
-	VIRTKEY_LOAD_STATE = 0x1000e,
-	VIRTKEY_NEXT_SLOT  = 0x1000f,
-	VIRTKEY_TOGGLE_FULLSCREEN = 0x10010,
-	VIRTKEY_ANALOG_LIGHTLY = 0x10011,
+	VIRTKEY_FIRST = 0x40000001,
+	VIRTKEY_AXIS_X_MIN = 0x40000001,
+	VIRTKEY_AXIS_Y_MIN = 0x40000002,
+	VIRTKEY_AXIS_X_MAX = 0x40000003,
+	VIRTKEY_AXIS_Y_MAX = 0x40000004,
+	VIRTKEY_RAPID_FIRE = 0x40000005,
+	VIRTKEY_UNTHROTTLE = 0x40000006,
+	VIRTKEY_PAUSE = 0x40000007,
+	VIRTKEY_SPEED_TOGGLE = 0x40000008,
+	VIRTKEY_AXIS_RIGHT_X_MIN = 0x40000009,
+	VIRTKEY_AXIS_RIGHT_Y_MIN = 0x4000000a,
+	VIRTKEY_AXIS_RIGHT_X_MAX = 0x4000000b,
+	VIRTKEY_AXIS_RIGHT_Y_MAX = 0x4000000c,
+	VIRTKEY_REWIND = 0x4000000d,
+	VIRTKEY_SAVE_STATE = 0x4000000e,
+	VIRTKEY_LOAD_STATE = 0x4000000f,
+	VIRTKEY_NEXT_SLOT = 0x40000010,
+	VIRTKEY_TOGGLE_FULLSCREEN = 0x40000011,
+	VIRTKEY_ANALOG_LIGHTLY = 0x40000012,
+	VIRTKEY_AXIS_SWAP = 0x40000013,
+	VIRTKEY_DEVMENU = 0x40000014,
+	VIRTKEY_FRAME_ADVANCE = 0x40000015,
+	VIRTKEY_RECORD = 0x40000016,
 	VIRTKEY_LAST,
 	VIRTKEY_COUNT = VIRTKEY_LAST - VIRTKEY_FIRST
 };
@@ -56,46 +61,11 @@ enum DefaultMaps {
 	DEFAULT_MAPPING_PAD,
 	DEFAULT_MAPPING_X360,
 	DEFAULT_MAPPING_SHIELD,
-	DEFAULT_MAPPING_BLACKBERRY_QWERTY,
 	DEFAULT_MAPPING_OUYA,
 	DEFAULT_MAPPING_XPERIA_PLAY,
 };
 
 const float AXIS_BIND_THRESHOLD = 0.75f;
-
-class KeyDef {
-public:
-	KeyDef() : deviceId(0), keyCode(0) {}
-	KeyDef(int devId, int k) : deviceId(devId), keyCode(k) {}
-	int deviceId;
-	int keyCode;
-
-	bool operator < (const KeyDef &other) const {
-		if (deviceId < other.deviceId) return true;
-		if (deviceId > other.deviceId) return false;
-		if (keyCode < other.keyCode) return true;
-		return false;
-	}
-	bool operator == (const KeyDef &other) const {
-		if (deviceId != other.deviceId) return false;
-		if (keyCode != other.keyCode) return false;
-		return true;
-	}
-};
-
-struct AxisPos {
-	int axis;
-	float position;
-
-	bool operator < (const AxisPos &other) const {
-		if (axis < other.axis) return true;
-		if (axis > other.axis) return false;
-		return position < other.position;
-	}
-	bool operator == (const AxisPos &other) const {
-		return axis == other.axis && position == other.position;
-	}
-};
 
 typedef std::map<int, std::vector<KeyDef>> KeyMapping;
 
@@ -117,7 +87,7 @@ namespace KeyMap {
 	// Key & Button names
 	struct KeyMap_IntStrPair {
 		int key;
-		std::string name;
+		const char *name;
 	};
 
 	// Use if you need to display the textual name
@@ -156,11 +126,12 @@ namespace KeyMap {
 
 	void RestoreDefault();
 
-	void UpdateConfirmCancelKeys();
+	void SwapAxis();
+	void UpdateNativeMenuKeys();
 
 	void NotifyPadConnected(const std::string &name);
 	bool IsNvidiaShield(const std::string &name);
-	bool IsBlackberryQWERTY(const std::string &name);
+	bool IsNvidiaShieldTV(const std::string &name);
 	bool IsXperiaPlay(const std::string &name);
 	bool IsOuya(const std::string &name);
 	bool HasBuiltinController(const std::string &name);

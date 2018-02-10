@@ -18,8 +18,9 @@
 #pragma once
 
 #include <cmath>
-#include "Common/Common.h"
 
+#include "Common/Common.h"
+#include "Core/Util/AudioFormat.h"  // for clamp_u8
 #include "math/fast/fast_matrix.h"
 
 #if defined(_M_SSE)
@@ -179,6 +180,9 @@ public:
 typedef Vec2<float> Vec2f;
 
 template<typename T>
+class Vec3Packed;
+
+template<typename T>
 class Vec3
 {
 public:
@@ -204,6 +208,11 @@ public:
 #if defined(_M_SSE)
 	Vec3(const __m128 &_vec) : vec(_vec) {}
 	Vec3(const __m128i &_ivec) : ivec(_ivec) {}
+	Vec3(const Vec3Packed<T> &_xyz) {
+		vec = _mm_loadu_ps(_xyz.AsArray());
+	}
+#else
+	Vec3(const Vec3Packed<T> &_xyz) : x(_xyz.x), y(_xyz.y), z(_xyz.z) {}
 #endif
 
 	template<typename T2>
@@ -368,6 +377,9 @@ public:
 	Vec3Packed(const T a[3]) : x(a[0]), y(a[1]), z(a[2]) {}
 	Vec3Packed(const T& _x, const T& _y, const T& _z) : x(_x), y(_y), z(_z) {}
 	Vec3Packed(const Vec2<T>& _xy, const T& _z) : x(_xy.x), y(_xy.y), z(_z) {}
+	Vec3Packed(const Vec3<T>& _xyz) {
+		memcpy(&x, _xyz.AsArray(), sizeof(float) * 3);
+	}
 
 	template<typename T2>
 	Vec3Packed<T2> Cast() const
@@ -549,7 +561,9 @@ public:
 
 	// Only implemented for T=int and T=float
 	static Vec4 FromRGBA(unsigned int rgba);
+	static Vec4 FromRGBA(const u8 *rgba);
 	unsigned int ToRGBA() const;
+	void ToRGBA(u8 *rgba) const;
 
 	static Vec4 AssignToAll(const T& f)
 	{
@@ -585,6 +599,10 @@ public:
 	{
 		return Vec4(x*other.x, y*other.y, z*other.z, w*other.w);
 	}
+	Vec4 operator | (const Vec4 &other) const
+	{
+		return Vec4(x | other.x, y | other.y, z | other.z, w | other.w);
+	}
 	template<typename V>
 	Vec4 operator * (const V& f) const
 	{
@@ -616,6 +634,12 @@ public:
 		return Vec4(VecClamp(x, l, h), VecClamp(y, l, h), VecClamp(z, l, h), VecClamp(w, l, h));
 	}
 
+	Vec4 Reciprocal() const
+	{
+		const T one = 1.0f;
+		return Vec4(one / x, one / y, one / z, one / w);
+	}
+
 	// Only implemented for T=float
 	float Length() const;
 	void SetLength(const float l);
@@ -635,7 +659,7 @@ public:
 
 	void SetZero()
 	{
-		x=0; y=0; z=0;
+		x=0; y=0; z=0; w=0;
 	}
 
 	// Common alias: RGBA (colors)
@@ -798,8 +822,7 @@ typedef Math3D::Vec3Packed<float> Vec3Packedf;
 typedef Math3D::Vec4<float> Vec4f;
 
 
-inline void Vec3ByMatrix43(float vecOut[3], const float v[3], const float m[12])
-{
+inline void Vec3ByMatrix43(float vecOut[3], const float v[3], const float m[12]) {
 	vecOut[0] = v[0] * m[0] + v[1] * m[3] + v[2] * m[6] + m[9];
 	vecOut[1] = v[0] * m[1] + v[1] * m[4] + v[2] * m[7] + m[10];
 	vecOut[2] = v[0] * m[2] + v[1] * m[5] + v[2] * m[8] + m[11];
@@ -871,6 +894,14 @@ inline void ConvertMatrix4x3To4x4Transposed(float *m4x4, const float *m4x3) {
 	m4x4[15] = 1.0f;
 }
 
+// 0369
+// 147A
+// 258B
+// ->>-
+// 0123
+// 4567
+// 89AB
+// Don't see a way to SIMD that. Should be pretty fast anyway.
 inline void ConvertMatrix4x3To3x4Transposed(float *m4x4, const float *m4x3) {
 	m4x4[0] = m4x3[0];
 	m4x4[1] = m4x3[3];
@@ -967,9 +998,9 @@ __forceinline unsigned int Vec3<float>::ToRGB() const
 	__m128i c16 = _mm_packs_epi32(c, c);
 	return _mm_cvtsi128_si32(_mm_packus_epi16(c16, c16)) & 0x00FFFFFF;
 #else
-	return ((unsigned int)(r()*255.f) << 0) |
-			((unsigned int)(g()*255.f) << 8) |
-			((unsigned int)(b()*255.f) << 16);
+	return (clamp_u8((int)(r() * 255.f)) << 0) |
+			(clamp_u8((int)(g() * 255.f)) << 8) |
+			(clamp_u8((int)(b() * 255.f)) << 16);
 #endif
 }
 
@@ -980,7 +1011,7 @@ __forceinline unsigned int Vec3<int>::ToRGB() const
 	__m128i c16 = _mm_packs_epi32(ivec, ivec);
 	return _mm_cvtsi128_si32(_mm_packus_epi16(c16, c16)) & 0x00FFFFFF;
 #else
-	return (r()&0xFF) | ((g()&0xFF)<<8) | ((b()&0xFF)<<16);
+	return clamp_u8(r()) | (clamp_u8(g()) << 8) | (clamp_u8(b()) << 16);
 #endif
 }
 
@@ -998,6 +1029,12 @@ inline Vec4<float> Vec4<float>::FromRGBA(unsigned int rgba)
 				((rgba >> 16) & 0xFF) * (1.0f/255.0f),
 				((rgba >> 24) & 0xFF) * (1.0f/255.0f));
 #endif
+}
+
+template<typename T>
+inline Vec4<T> Vec4<T>::FromRGBA(const u8 *rgba)
+{
+	return Vec4<T>::FromRGBA(*(unsigned int *)rgba);
 }
 
 template<>
@@ -1021,10 +1058,10 @@ __forceinline unsigned int Vec4<float>::ToRGBA() const
 	__m128i c16 = _mm_packs_epi32(c, c);
 	return _mm_cvtsi128_si32(_mm_packus_epi16(c16, c16));
 #else
-	return ((unsigned int)(r()*255.f) << 0) |
-			((unsigned int)(g()*255.f) << 8) |
-			((unsigned int)(b()*255.f) << 16) |
-			((unsigned int)(a()*255.f) << 24);
+	return (clamp_u8((int)(r() * 255.f)) << 0) |
+			(clamp_u8((int)(g() * 255.f)) << 8) |
+			(clamp_u8((int)(b() * 255.f)) << 16) |
+			(clamp_u8((int)(a() * 255.f)) << 24);
 #endif
 }
 
@@ -1035,8 +1072,14 @@ __forceinline unsigned int Vec4<int>::ToRGBA() const
 	__m128i c16 = _mm_packs_epi32(ivec, ivec);
 	return _mm_cvtsi128_si32(_mm_packus_epi16(c16, c16));
 #else
-	return (r()&0xFF) | ((g()&0xFF)<<8) | ((b()&0xFF)<<16) | ((a()&0xFF)<<24);
+	return clamp_u8(r()) | (clamp_u8(g()) << 8) | (clamp_u8(b()) << 16) | (clamp_u8(a()) << 24);
 #endif
+}
+
+template<typename T>
+__forceinline void Vec4<T>::ToRGBA(u8 *rgba) const
+{
+	*(u32 *)rgba = ToRGBA();
 }
 
 }; // namespace Math3D

@@ -15,15 +15,17 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include <algorithm>
+
 #include "base/basictypes.h"
-#include "Globals.h"
-#include "Core/MemMap.h"
+#include "profiler/profiler.h"
+
+#include "Core/MemMapHelpers.h"
 #include "Core/HLE/sceAtrac.h"
 #include "Core/Config.h"
 #include "Core/Reporting.h"
+#include "Core/Util/AudioFormat.h"
 #include "SasAudio.h"
-
-#include <algorithm>
 
 // #define AUDIO_TO_FILE
 
@@ -89,6 +91,7 @@ void VagDecoder::DecodeBlock(u8 *&read_pointer) {
 	int coef1 = f[predict_nr][0];
 	int coef2 = -f[predict_nr][1];
 
+	// TODO: Unroll once more and interleave the unpacking with the decoding more?
 	for (int i = 0; i < 28; i += 2) {
 		u8 d = *readp++;
 		int sample1 = (short)((d & 0xf) << 12) >> shift_factor;
@@ -115,11 +118,11 @@ void VagDecoder::GetSamples(s16 *outSamples, int numSamples) {
 		memset(outSamples, 0, numSamples * sizeof(s16));
 		return;
 	}
-	u8 *readp = Memory::GetPointer(read_);
-	if (!readp) {
+	if (!Memory::IsValidAddress(read_)) {
 		WARN_LOG(SASMIX, "Bad VAG samples address?");
 		return;
 	}
+	u8 *readp = Memory::GetPointerUnchecked(read_);
 	u8 *origp = readp;
 
 	for (int i = 0; i < numSamples; i++) {
@@ -149,11 +152,19 @@ void VagDecoder::GetSamples(s16 *outSamples, int numSamples) {
 }
 
 void VagDecoder::DoState(PointerWrap &p) {
-	auto s = p.Section("VagDecoder", 1);
+	auto s = p.Section("VagDecoder", 1, 2);
 	if (!s)
 		return;
 
-	p.DoArray(samples, ARRAY_SIZE(samples));
+	if (s >= 2) {
+		p.DoArray(samples, ARRAY_SIZE(samples));
+	} else {
+		int samplesOld[ARRAY_SIZE(samples)];
+		p.DoArray(samplesOld, ARRAY_SIZE(samples));
+		for (size_t i = 0; i < ARRAY_SIZE(samples); ++i) {
+			samples[i] = samplesOld[i];
+		}
+	}
 	p.Do(curSample);
 
 	p.Do(data_);
@@ -171,49 +182,55 @@ void VagDecoder::DoState(PointerWrap &p) {
 }
 
 int SasAtrac3::setContext(u32 context) {
-	contextAddr = context;
-	atracID = _AtracGetIDByContext(context);
-	if (!sampleQueue)
-		sampleQueue = new BufferQueue();
-	sampleQueue->clear();
+	contextAddr_ = context;
+	atracID_ = _AtracGetIDByContext(context);
+	if (!sampleQueue_)
+		sampleQueue_ = new BufferQueue();
+	sampleQueue_->clear();
+	end_ = false;
 	return 0;
 }
 
-int SasAtrac3::getNextSamples(s16* outbuf, int wantedSamples) {
-	if (atracID < 0)
-		return -1;
+void SasAtrac3::getNextSamples(s16 *outbuf, int wantedSamples) {
+	if (atracID_ < 0) {
+		end_ = true;
+		return;
+	}
 	u32 finish = 0;
 	int wantedbytes = wantedSamples * sizeof(s16);
-	while (!finish && sampleQueue->getQueueSize() < wantedbytes) {
+	while (!finish && sampleQueue_->getQueueSize() < wantedbytes) {
 		u32 numSamples = 0;
 		int remains = 0;
 		static s16 buf[0x800];
-		_AtracDecodeData(atracID, (u8*)buf, 0, &numSamples, &finish, &remains);
+		_AtracDecodeData(atracID_, (u8*)buf, 0, &numSamples, &finish, &remains);
 		if (numSamples > 0)
-			sampleQueue->push((u8*)buf, numSamples * sizeof(s16));
+			sampleQueue_->push((u8*)buf, numSamples * sizeof(s16));
 		else
 			finish = 1;
 	}
-	sampleQueue->pop_front((u8*)outbuf, wantedbytes);
-	return finish;
+	sampleQueue_->pop_front((u8*)outbuf, wantedbytes);
+	end_ = finish == 1;
 }
 
 int SasAtrac3::addStreamData(u32 bufPtr, u32 addbytes) {
-	if (atracID > 0) {
-		_AtracAddStreamData(atracID, bufPtr, addbytes);
+	if (atracID_ > 0) {
+		_AtracAddStreamData(atracID_, bufPtr, addbytes);
 	}
 	return 0;
 }
 
 void SasAtrac3::DoState(PointerWrap &p) {
-	auto s = p.Section("SasAtrac3", 1);
+	auto s = p.Section("SasAtrac3", 1, 2);
 	if (!s)
 		return;
 
-	p.Do(contextAddr);
-	p.Do(atracID);
-	if (p.mode == p.MODE_READ && atracID >= 0 && !sampleQueue) {
-		sampleQueue = new BufferQueue();
+	p.Do(contextAddr_);
+	p.Do(atracID_);
+	if (p.mode == p.MODE_READ && atracID_ >= 0 && !sampleQueue_) {
+		sampleQueue_ = new BufferQueue();
+	}
+	if (s >= 2) {
+		p.Do(end_);
 	}
 }
 
@@ -308,7 +325,7 @@ void ADSREnvelope::SetSimpleEnvelope(u32 ADSREnv1, u32 ADSREnv2) {
 	sustainLevel 	= getSustainLevel(ADSREnv1);
 
 	if (attackRate < 0 || decayRate < 0 || sustainRate < 0 || releaseRate < 0) {
-		ERROR_LOG_REPORT(SCESAS, "Simple ADSR resulted in invalid rates: %04x, %04x", ADSREnv1, ADSREnv2);
+		ERROR_LOG_REPORT(SASMIX, "Simple ADSR resulted in invalid rates: %04x, %04x", ADSREnv1, ADSREnv2);
 	}
 }
 
@@ -318,7 +335,8 @@ SasInstance::SasInstance()
 		outputMode(PSP_SAS_OUTPUTMODE_MIXED),
 		mixBuffer(0),
 		sendBuffer(0),
-		resampleBuffer(0),
+		sendBufferDownsampled(0),
+		sendBufferProcessed(0),
 		grainSize(0) {
 #ifdef AUDIO_TO_FILE
 	audioDump = fopen("D:\\audio.raw", "wb");
@@ -332,36 +350,68 @@ SasInstance::~SasInstance() {
 	ClearGrainSize();
 }
 
+void SasInstance::GetDebugText(char *text, size_t bufsize) {
+	char voiceBuf[4096];
+	voiceBuf[0] = '\0';
+	char *p = voiceBuf;
+	for (int i = 0; i < maxVoices; i++) {
+		if (voices[i].playing) {
+			p += snprintf(p, sizeof(voiceBuf) - (p - voiceBuf), " %d: Pitch %d L/R,FX: %d,%d|%d,%d VAG: %08x:%d:%08x Height:%d%%\n", i, voices[i].pitch, voices[i].volumeLeft, voices[i].volumeRight, voices[i].effectLeft, voices[i].effectRight, voices[i].vagAddr, voices[i].vagSize, voices[i].vag.GetReadPtr(), (int)((int64_t)voices[i].envelope.GetHeight() * 100 / PSP_SAS_ENVELOPE_HEIGHT_MAX));
+		}
+	}
+
+	snprintf(text, bufsize,
+		"SR: %d Mode: %s Grain: %d\n"
+		"Effect: Type: %d Dry: %d Wet: %d L: %d R: %d Delay: %d Feedback: %d\n"
+		"\n%s\n",
+		sampleRate, outputMode == PSP_SAS_OUTPUTMODE_RAW ? "Raw" : "Mixed", grainSize,
+		waveformEffect.type, waveformEffect.isDryOn, waveformEffect.isWetOn, waveformEffect.leftVol, waveformEffect.rightVol, waveformEffect.delay, waveformEffect.feedback,
+		voiceBuf);
+
+}
+
 void SasInstance::ClearGrainSize() {
-	if (mixBuffer)
-		delete [] mixBuffer;
-	if (sendBuffer)
-		delete [] sendBuffer;
-	if (resampleBuffer)
-		delete [] resampleBuffer;
-	mixBuffer = NULL;
-	sendBuffer = NULL;
-	resampleBuffer = NULL;
+	delete[] mixBuffer;
+	delete[] sendBuffer;
+	delete[] sendBufferDownsampled;
+	delete[] sendBufferProcessed;
+	mixBuffer = nullptr;
+	sendBuffer = nullptr;
+	sendBufferDownsampled = nullptr;
+	sendBufferProcessed = nullptr;
 }
 
 void SasInstance::SetGrainSize(int newGrainSize) {
 	grainSize = newGrainSize;
 
 	// If you change the sizes here, don't forget DoState().
-	if (mixBuffer)
-		delete [] mixBuffer;
-	if (sendBuffer)
-		delete [] sendBuffer;
+	delete[] mixBuffer;
+	delete[] sendBuffer;
+	delete[] sendBufferDownsampled;
+	delete[] sendBufferProcessed;
+
 	mixBuffer = new s32[grainSize * 2];
 	sendBuffer = new s32[grainSize * 2];
+	sendBufferDownsampled = new s16[grainSize];
+	sendBufferProcessed = new s16[grainSize * 2];
 	memset(mixBuffer, 0, sizeof(int) * grainSize * 2);
 	memset(sendBuffer, 0, sizeof(int) * grainSize * 2);
-	if (resampleBuffer)
-		delete [] resampleBuffer;
+	memset(sendBufferDownsampled, 0, sizeof(s16) * grainSize);
+	memset(sendBufferProcessed, 0, sizeof(s16) * grainSize * 2);
+}
 
-	// 2 samples padding at the start, that's where we copy the two last samples from the channel
-	// so that we can do bicubic resampling if necessary.  Plus 1 for smoothness hackery.
-	resampleBuffer = new s16[grainSize * 4 + 3];
+int SasInstance::EstimateMixUs() {
+	int voicesPlayingCount = 0;
+
+	for (int v = 0; v < PSP_SAS_VOICES_MAX; v++) {
+		SasVoice &voice = voices[v];
+		if (!voice.playing || voice.paused)
+			continue;
+		voicesPlayingCount++;
+	}
+
+	// Each voice costs extra time, and each byte of grain costs extra time.
+	return 20 + voicesPlayingCount * 68 + (grainSize * 60) / 100;
 }
 
 void SasVoice::ReadSamples(s16 *output, int numSamples) {
@@ -398,25 +448,15 @@ void SasVoice::ReadSamples(s16 *output, int numSamples) {
 		}
 		break;
 	case VOICETYPE_ATRAC3:
-		{
-			int ret = atrac3.getNextSamples(output, numSamples);
-			if (ret) {
-				// Hit atrac3 voice end
-				playing = false;
-				on = false;  // ??
-				envelope.End();
-			}
-		}
+		atrac3.getNextSamples(output, numSamples);
 		break;
 	default:
-		{
-			memset(output, 0, numSamples * sizeof(s16));
-		}
+		memset(output, 0, numSamples * sizeof(s16));
 		break;
 	}
 }
 
-bool SasVoice::HaveSamplesEnded() {
+bool SasVoice::HaveSamplesEnded() const {
 	switch (type) {
 	case VOICETYPE_VAG:
 		return vag.End();
@@ -425,8 +465,7 @@ bool SasVoice::HaveSamplesEnded() {
 		return pcmIndex >= pcmSize;
 
 	case VOICETYPE_ATRAC3:
-		// TODO: Is it here, or before the samples are processed?
-		return false;
+		return atrac3.End();
 
 	default:
 		return false;
@@ -444,53 +483,46 @@ void SasInstance::MixVoice(SasVoice &voice) {
 			break;
 		// else fallthrough! Don't change the check above.
 	default:
-		// Load resample history (so we can use a wide filter)
-		resampleBuffer[0] = voice.resampleHist[0];
-		resampleBuffer[1] = voice.resampleHist[1];
-
-		// Figure out number of samples to read.
-		// Actually this is not entirely correct - we need to get one extra sample, and store it
-		// for the next time around. A little complicated...
-		// But for now, see Smoothness HACKERY below :P
-		u32 numSamples = ((u32)voice.sampleFrac + (u32)grainSize * (u32)voice.pitch) >> PSP_SAS_PITCH_BASE_SHIFT;
-		if ((int)numSamples > grainSize * 4) {
-			ERROR_LOG(SASMIX, "numSamples too large, clamping: %i vs %i", numSamples, grainSize * 4);
-			numSamples = grainSize * 4;
-		}
-
 		// This feels a bit hacky.  The first 32 samples after a keyon are 0s.
-		const bool ignorePitch = voice.type == VOICETYPE_PCM && voice.pitch > PSP_SAS_PITCH_BASE;
+		int delay = 0;
 		if (voice.envelope.NeedsKeyOn()) {
-			int delay = ignorePitch ? 32 : (32 * (u32)voice.pitch) >> PSP_SAS_PITCH_BASE_SHIFT;
+			const bool ignorePitch = voice.type == VOICETYPE_PCM && voice.pitch > PSP_SAS_PITCH_BASE;
+			delay = ignorePitch ? 32 : (32 * (u32)voice.pitch) >> PSP_SAS_PITCH_BASE_SHIFT;
 			// VAG seems to have an extra sample delay (not shared by PCM.)
 			if (voice.type == VOICETYPE_VAG)
 				++delay;
-			voice.ReadSamples(resampleBuffer + 2 + delay, numSamples - delay);
-		} else {
-			voice.ReadSamples(resampleBuffer + 2, numSamples);
 		}
 
-		// Smoothness HACKERY
-		resampleBuffer[2 + numSamples] = resampleBuffer[2 + numSamples - 1];
-
-		// Save resample history
-		voice.resampleHist[0] = resampleBuffer[2 + numSamples - 2];
-		voice.resampleHist[1] = resampleBuffer[2 + numSamples - 1];
-
-		// Resample to the correct pitch, writing exactly "grainSize" samples.
-		// This is a HORRIBLE resampler by the way.
+		// Resample to the correct pitch, writing exactly "grainSize" samples. We need a buffer that can
+		// fit 4x that, as the max pitch is 0x4000.
 		// TODO: Special case no-resample case (and 2x and 0.5x) for speed, it's not uncommon
 
+		// Two passes: First read, then resample.
+		mixTemp_[0] = voice.resampleHist[0];
+		mixTemp_[1] = voice.resampleHist[1];
+
+		int voicePitch = voice.pitch;
 		u32 sampleFrac = voice.sampleFrac;
-		// We need to shift by 12 anyway, so combine that with the volume shift.
-		for (int i = 0; i < grainSize; i++) {
-			// For now: nearest neighbour, not even using the resample history at all.
-			int sample = resampleBuffer[sampleFrac / PSP_SAS_PITCH_BASE + 2];
-			sampleFrac += voice.pitch;
+		int samplesToRead = (sampleFrac + voicePitch * std::max(0, grainSize - delay)) >> PSP_SAS_PITCH_BASE_SHIFT;
+		if (samplesToRead > ARRAY_SIZE(mixTemp_) - 2) {
+			ERROR_LOG(SCESAS, "Too many samples to read (%d)! This shouldn't happen.", samplesToRead);
+			samplesToRead = ARRAY_SIZE(mixTemp_) - 2;
+		}
+		voice.ReadSamples(&mixTemp_[2], samplesToRead);
+		int tempPos = 2 + samplesToRead;
+
+		for (int i = delay; i < grainSize; i++) {
+			const int16_t *s = mixTemp_ + (sampleFrac >> PSP_SAS_PITCH_BASE_SHIFT);
+
+			// Linear interpolation. Good enough. Need to make resampleHist bigger if we want more.
+			int f = sampleFrac & PSP_SAS_PITCH_MASK;
+			int sample = (s[0] * (PSP_SAS_PITCH_MASK - f) + s[1] * f) >> PSP_SAS_PITCH_BASE_SHIFT;
+			sampleFrac += voicePitch;
 
 			// The maximum envelope height (PSP_SAS_ENVELOPE_HEIGHT_MAX) is (1 << 30) - 1.
 			// Reduce it to 14 bits, by shifting off 15.  Round up by adding (1 << 14) first.
 			int envelopeValue = voice.envelope.GetHeight();
+			voice.envelope.Step();
 			envelopeValue = (envelopeValue + (1 << 14)) >> 15;
 
 			// We just scale by the envelope before we scale by volumes.
@@ -500,23 +532,21 @@ void SasInstance::MixVoice(SasVoice &voice) {
 			// We mix into this 32-bit temp buffer and clip in a second loop
 			// Ideally, the shift right should be there too but for now I'm concerned about
 			// not overflowing.
-			mixBuffer[i * 2] += (sample * voice.volumeLeft ) >> 12;
+			mixBuffer[i * 2] += (sample * voice.volumeLeft) >> 12;
 			mixBuffer[i * 2 + 1] += (sample * voice.volumeRight) >> 12;
 			sendBuffer[i * 2] += sample * voice.effectLeft >> 12;
 			sendBuffer[i * 2 + 1] += sample * voice.effectRight >> 12;
-			voice.envelope.Step();
 		}
 
-		voice.sampleFrac = sampleFrac;
-		// Let's hope grainSize is a power of 2.
-		//voice.sampleFrac &= grainSize * PSP_SAS_PITCH_BASE - 1;
-		voice.sampleFrac -= numSamples * PSP_SAS_PITCH_BASE;
+		voice.resampleHist[0] = mixTemp_[tempPos - 2];
+		voice.resampleHist[1] = mixTemp_[tempPos - 1];
+
+		voice.sampleFrac = sampleFrac - (tempPos - 2) * PSP_SAS_PITCH_BASE;;
 
 		if (voice.HaveSamplesEnded())
 			voice.envelope.End();
-		if (voice.envelope.HasEnded())
-		{
-			// NOTICE_LOG(SCESAS, "Hit end of envelope");
+		if (voice.envelope.HasEnded()) {
+			// NOTICE_LOG(SASMIX, "Hit end of envelope");
 			voice.playing = false;
 			voice.on = false;
 		}
@@ -534,37 +564,20 @@ void SasInstance::Mix(u32 outAddr, u32 inAddr, int leftVol, int rightVol) {
 		MixVoice(voice);
 	}
 
-	// Okay, apply effects processing to the Send buffer.
-	// TODO: Is this only done in PSP_SAS_OUTPUTMODE_MIXED?
-	//if (waveformEffect.type != PSP_SAS_EFFECT_TYPE_OFF)
-	//	ApplyReverb();
-
 	// Then mix the send buffer in with the rest.
 
 	// Alright, all voices mixed. Let's convert and clip, and at the same time, wipe mixBuffer for next time. Could also dither.
 	s16 *outp = (s16 *)Memory::GetPointer(outAddr);
 	const s16 *inp = inAddr ? (s16*)Memory::GetPointer(inAddr) : 0;
 	if (outputMode == PSP_SAS_OUTPUTMODE_MIXED) {
-		// TODO: Mix send when it has proper values, probably based on dry/wet?
-		if (inp) {
-			for (int i = 0; i < grainSize * 2; i += 2) {
-				int sampleL = mixBuffer[i + 0] + ((*inp++) * leftVol >> 12);
-				int sampleR = mixBuffer[i + 1] + ((*inp++) * rightVol >> 12);
-				*outp++ = clamp_s16(sampleL);
-				*outp++ = clamp_s16(sampleR);
-			}
-		} else {
-			for (int i = 0; i < grainSize * 2; i += 2) {
-				*outp++ = clamp_s16(mixBuffer[i + 0]);
-				*outp++ = clamp_s16(mixBuffer[i + 1]);
-			}
-		}
+		// Okay, apply effects processing to the Send buffer.
+		WriteMixedOutput(outp, inp, leftVol, rightVol);
 	} else {
 		s16 *outpL = outp + grainSize * 0;
 		s16 *outpR = outp + grainSize * 1;
 		s16 *outpSendL = outp + grainSize * 2;
 		s16 *outpSendR = outp + grainSize * 3;
-		WARN_LOG_REPORT_ONCE(sasraw, SCESAS, "sceSasCore: raw outputMode");
+		WARN_LOG_REPORT_ONCE(sasraw, SASMIX, "sceSasCore: raw outputMode");
 		for (int i = 0; i < grainSize * 2; i += 2) {
 			*outpL++ = clamp_s16(mixBuffer[i + 0]);
 			*outpR++ = clamp_s16(mixBuffer[i + 1]);
@@ -580,10 +593,79 @@ void SasInstance::Mix(u32 outAddr, u32 inAddr, int leftVol, int rightVol) {
 #endif
 }
 
-void SasInstance::ApplyReverb() {
-	// for (int i = 0; i < grainSize * 2; i += 2) {
-		// modify sendBuffer
-	// }
+void SasInstance::WriteMixedOutput(s16 *outp, const s16 *inp, int leftVol, int rightVol) {
+	const bool dry = waveformEffect.isDryOn != 0;
+	const bool wet = waveformEffect.isWetOn != 0;
+	if (wet) {
+		ApplyWaveformEffect();
+	}
+
+	if (inp) {
+		for (int i = 0; i < grainSize * 2; i += 2) {
+			int sampleL = ((*inp++) * leftVol >> 12);
+			int sampleR = ((*inp++) * rightVol >> 12);
+			if (dry) {
+				sampleL += mixBuffer[i + 0];
+				sampleR += mixBuffer[i + 1];
+			}
+			if (wet) {
+				sampleL += sendBufferProcessed[i + 0];
+				sampleR += sendBufferProcessed[i + 1];
+			}
+			*outp++ = clamp_s16(sampleL);
+			*outp++ = clamp_s16(sampleR);
+		}
+	} else {
+		// These are the optimal cases.
+		if (dry && wet) {
+			for (int i = 0; i < grainSize * 2; i += 2) {
+				*outp++ = clamp_s16(mixBuffer[i + 0] + sendBufferProcessed[i + 0]);
+				*outp++ = clamp_s16(mixBuffer[i + 1] + sendBufferProcessed[i + 1]);
+			}
+		} else if (dry) {
+			for (int i = 0; i < grainSize * 2; i += 2) {
+				*outp++ = clamp_s16(mixBuffer[i + 0]);
+				*outp++ = clamp_s16(mixBuffer[i + 1]);
+			}
+		} else {
+			// This is another uncommon case, dry must be off but let's keep it for clarity.
+			for (int i = 0; i < grainSize * 2; i += 2) {
+				int sampleL = 0;
+				int sampleR = 0;
+				if (dry) {
+					sampleL += mixBuffer[i + 0];
+					sampleR += mixBuffer[i + 1];
+				}
+				if (wet) {
+					sampleL += sendBufferProcessed[i + 0];
+					sampleR += sendBufferProcessed[i + 1];
+				}
+				*outp++ = clamp_s16(sampleL);
+				*outp++ = clamp_s16(sampleR);
+			}
+		}
+	}
+}
+
+void SasInstance::SetWaveformEffectType(int type) {
+	if (type != waveformEffect.type) {
+		waveformEffect.type = type;
+		reverb_.SetPreset(type);
+	}
+}
+
+// http://psx.rules.org/spu.txt has some information about setting up the delay time by modifying the delay preset.
+// See http://report.ppsspp.org/logs/kind/772 for a list of games that use different types. Maybe can help us figure out
+// which is which.
+void SasInstance::ApplyWaveformEffect() {
+	// First, downsample the send buffer to 22khz. We do this naively for now.
+	for (int i = 0; i < grainSize / 2; i++) {
+		sendBufferDownsampled[i * 2] = clamp_s16(sendBuffer[i * 4]);
+		sendBufferDownsampled[i * 2 + 1] = clamp_s16(sendBuffer[i * 4 + 1]);
+	}
+
+	// Volume max is 0x1000, while our factor is up to 0x8000. Shifting right by 3 fixes that.
+	reverb_.ProcessReverb(sendBufferProcessed, sendBufferDownsampled, grainSize / 2, waveformEffect.leftVol << 3, waveformEffect.rightVol << 3);
 }
 
 void SasInstance::DoState(PointerWrap &p) {
@@ -611,19 +693,24 @@ void SasInstance::DoState(PointerWrap &p) {
 	if (sendBuffer != NULL && grainSize > 0) {
 		p.DoArray(sendBuffer, grainSize * 2);
 	}
-	if (resampleBuffer != NULL && grainSize > 0) {
-		p.DoArray(resampleBuffer, grainSize * 4 + 3);
+	if (sendBuffer != NULL && grainSize > 0) {
+		// Backwards compat
+		int16_t *resampleBuf = new int16_t[grainSize * 4 + 3]();
+		p.DoArray(resampleBuf, grainSize * 4 + 3);
+		delete[] resampleBuf;
 	}
 
 	int n = PSP_SAS_VOICES_MAX;
 	p.Do(n);
-	if (n != PSP_SAS_VOICES_MAX)
-	{
-		ERROR_LOG(HLE, "Savestate failure: wrong number of SAS voices");
+	if (n != PSP_SAS_VOICES_MAX) {
+		ERROR_LOG(SAVESTATE, "Wrong number of SAS voices");
 		return;
 	}
 	p.DoArray(voices, ARRAY_SIZE(voices));
 	p.Do(waveformEffect);
+	if (p.mode == p.MODE_READ) {
+		reverb_.SetPreset(waveformEffect.type);
+	}
 }
 
 void SasVoice::Reset() {
@@ -665,8 +752,7 @@ void SasVoice::ChangedParams(bool changedVag) {
 	// TODO: restart VAG somehow
 }
 
-void SasVoice::DoState(PointerWrap &p)
-{
+void SasVoice::DoState(PointerWrap &p) {
 	auto s = p.Section("SasVoice", 1, 3);
 	if (!s)
 		return;

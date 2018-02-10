@@ -15,6 +15,9 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include "ppsspp_config.h"
+#if PPSSPP_ARCH(ARM)
+
 #include "Core/Config.h"
 #include "Core/MemMap.h"
 #include "Core/MIPS/MIPS.h"
@@ -40,14 +43,16 @@
 // All functions should have CONDITIONAL_DISABLE, so we can narrow things down to a file quickly.
 // Currently known non working ones should have DISABLE.
 
-//#define CONDITIONAL_DISABLE { Comp_Generic(op); return; }
+// #define CONDITIONAL_DISABLE { Comp_Generic(op); return; }
 #define CONDITIONAL_DISABLE ;
 #define DISABLE { Comp_Generic(op); return; }
 
 namespace MIPSComp
 {
+	using namespace ArmGen;
+	using namespace ArmJitConstants;
 
-void Jit::Comp_FPU3op(MIPSOpcode op)
+void ArmJit::Comp_FPU3op(MIPSOpcode op)
 { 
 	CONDITIONAL_DISABLE;
 
@@ -61,7 +66,7 @@ void Jit::Comp_FPU3op(MIPSOpcode op)
 	case 0: VADD(fpr.R(fd), fpr.R(fs), fpr.R(ft)); break; //F(fd) = F(fs) + F(ft); //add
 	case 1: VSUB(fpr.R(fd), fpr.R(fs), fpr.R(ft)); break; //F(fd) = F(fs) - F(ft); //sub
 	case 2: { //F(fd) = F(fs) * F(ft); //mul
-		MIPSOpcode nextOp = Memory::Read_Instruction(js.compilerPC + 4);
+		MIPSOpcode nextOp = GetOffsetInstruction(1);
 		// Optimization possible if destination is the same
 		if (fd == (int)((nextOp>>6) & 0x1F)) {
 			// VMUL + VNEG -> VNMUL
@@ -85,7 +90,7 @@ void Jit::Comp_FPU3op(MIPSOpcode op)
 
 extern int logBlocks;
 
-void Jit::Comp_FPULS(MIPSOpcode op)
+void ArmJit::Comp_FPULS(MIPSOpcode op)
 {
 	CONDITIONAL_DISABLE;
 
@@ -128,7 +133,6 @@ void Jit::Comp_FPULS(MIPSOpcode op)
 		VLDR(fpr.R(ft), R0, 0);
 		if (doCheck) {
 			SetJumpTarget(skip);
-			SetCC(CC_AL);
 		}
 #else
 		VLDR(fpr.R(ft), R0, 0);
@@ -172,7 +176,6 @@ void Jit::Comp_FPULS(MIPSOpcode op)
 		VSTR(fpr.R(ft), R0, 0);
 		if (doCheck) {
 			SetJumpTarget(skip2);
-			SetCC(CC_AL);
 		}
 #else
 		VSTR(fpr.R(ft), R0, 0);
@@ -188,7 +191,7 @@ void Jit::Comp_FPULS(MIPSOpcode op)
 	}
 }
 
-void Jit::Comp_FPUComp(MIPSOpcode op) {
+void ArmJit::Comp_FPUComp(MIPSOpcode op) {
 	CONDITIONAL_DISABLE;
 
 	int opc = op & 0xF;
@@ -253,14 +256,11 @@ void Jit::Comp_FPUComp(MIPSOpcode op) {
 	SetCC(CC_AL);
 }
 
-void Jit::Comp_FPU2op(MIPSOpcode op) {
+void ArmJit::Comp_FPU2op(MIPSOpcode op) {
 	CONDITIONAL_DISABLE;
 
 	int fs = _FS;
 	int fd = _FD;
-
-	// TODO: Most of these mishandle infinity/NAN.
-	// Maybe we can try to track per reg if they *could* be INF/NAN to optimize out?
 
 	switch (op & 0x3f) {
 	case 4:	//F(fd)	   = sqrtf(F(fs));            break; //sqrt
@@ -280,7 +280,7 @@ void Jit::Comp_FPU2op(MIPSOpcode op) {
 		VNEG(fpr.R(fd), fpr.R(fs));
 		break;
 	case 12: //FsI(fd) = (int)floorf(F(fs)+0.5f); break; //round.w.s
-		ClearRoundingMode();
+		RestoreRoundingMode();
 		fpr.MapDirtyIn(fd, fs);
 		VCVT(fpr.R(fd), fpr.R(fs), TO_INT | IS_SIGNED);
 		break;
@@ -295,7 +295,7 @@ void Jit::Comp_FPU2op(MIPSOpcode op) {
 		break;
 	case 14: //FsI(fd) = (int)ceilf (F(fs));      break; //ceil.w.s
 	{
-		ClearRoundingMode();
+		RestoreRoundingMode();
 		fpr.MapDirtyIn(fd, fs);
 		VMRS(SCRATCHREG2);
 		// Assume we're always in round-to-nearest mode.
@@ -313,7 +313,7 @@ void Jit::Comp_FPU2op(MIPSOpcode op) {
 	}
 	case 15: //FsI(fd) = (int)floorf(F(fs));      break; //floor.w.s
 	{
-		ClearRoundingMode();
+		RestoreRoundingMode();
 		fpr.MapDirtyIn(fd, fs);
 		VMRS(SCRATCHREG2);
 		// Assume we're always in round-to-nearest mode.
@@ -347,7 +347,7 @@ void Jit::Comp_FPU2op(MIPSOpcode op) {
 	}
 }
 
-void Jit::Comp_mxc1(MIPSOpcode op)
+void ArmJit::Comp_mxc1(MIPSOpcode op)
 {
 	CONDITIONAL_DISABLE;
 
@@ -357,12 +357,21 @@ void Jit::Comp_mxc1(MIPSOpcode op)
 	switch ((op >> 21) & 0x1f)
 	{
 	case 0: // R(rt) = FI(fs); break; //mfc1
-		fpr.MapReg(fs);
+		if (rt == MIPS_REG_ZERO) {
+			return;
+		}
 		gpr.MapReg(rt, MAP_DIRTY | MAP_NOINIT);
-		VMOV(gpr.R(rt), fpr.R(fs));
+		if (fpr.IsMapped(fs)) {
+			VMOV(gpr.R(rt), fpr.R(fs));
+		} else {
+			LDR(gpr.R(rt), CTXREG, fpr.GetMipsRegOffset(fs));
+		}
 		return;
 
 	case 2: //cfc1
+		if (rt == MIPS_REG_ZERO) {
+			return;
+		}
 		if (fs == 31) {
 			if (gpr.IsImm(MIPS_REG_FPCOND)) {
 				gpr.MapReg(rt, MAP_DIRTY | MAP_NOINIT);
@@ -375,7 +384,7 @@ void Jit::Comp_mxc1(MIPSOpcode op)
 			} else {
 				gpr.MapDirtyIn(rt, MIPS_REG_FPCOND);
 				LDR(gpr.R(rt), CTXREG, offsetof(MIPSState, fcr31));
-#ifdef HAVE_ARMV7
+#if PPSSPP_ARCH(ARMV7)
 				BFI(gpr.R(rt), gpr.R(MIPS_REG_FPCOND), 23, 1);
 #else
 				AND(SCRATCHREG1, gpr.R(MIPS_REG_FPCOND), Operand2(1)); // Just in case
@@ -392,15 +401,20 @@ void Jit::Comp_mxc1(MIPSOpcode op)
 		return;
 
 	case 4: //FI(fs) = R(rt);	break; //mtc1
-		gpr.MapReg(rt);
-		fpr.MapReg(fs, MAP_DIRTY | MAP_NOINIT);
-		VMOV(fpr.R(fs), gpr.R(rt));
+		if (gpr.IsImm(rt) && gpr.GetImm(rt) == 0) {
+			fpr.MapReg(fs, MAP_NOINIT);
+			MOVI2F(fpr.R(fs), 0.0f, R0);
+		} else {
+			gpr.MapReg(rt);
+			fpr.MapReg(fs, MAP_NOINIT);
+			VMOV(fpr.R(fs), gpr.R(rt));
+		}
 		return;
 
 	case 6: //ctc1
 		if (fs == 31) {
-			// Must clear before setting, since SetRoundingMode() assumes it was cleared.
-			ClearRoundingMode();
+			// Must clear before setting, since ApplyRoundingMode() assumes it was cleared.
+			RestoreRoundingMode();
 			bool wasImm = gpr.IsImm(rt);
 			if (wasImm) {
 				gpr.SetImm(MIPS_REG_FPCOND, (gpr.GetImm(rt) >> 23) & 1);
@@ -413,14 +427,15 @@ void Jit::Comp_mxc1(MIPSOpcode op)
 			// TODO: Technically, should mask by 0x0181FFFF.  Maybe just put all of FCR31 in the reg?
 			STR(gpr.R(rt), CTXREG, offsetof(MIPSState, fcr31));
 			if (!wasImm) {
-#ifdef HAVE_ARMV7
+#if PPSSPP_ARCH(ARMV7)
 				UBFX(gpr.R(MIPS_REG_FPCOND), gpr.R(rt), 23, 1);
 #else
 				MOV(SCRATCHREG1, Operand2(gpr.R(rt), ST_LSR, 23));
 				AND(gpr.R(MIPS_REG_FPCOND), SCRATCHREG1, Operand2(1));
 #endif
 			}
-			SetRoundingMode();
+			UpdateRoundingMode();
+			ApplyRoundingMode();
 		} else {
 			Comp_Generic(op);
 		}
@@ -429,3 +444,5 @@ void Jit::Comp_mxc1(MIPSOpcode op)
 }
 
 }	// namespace MIPSComp
+
+#endif // PPSSPP_ARCH(ARM)

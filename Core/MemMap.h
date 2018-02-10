@@ -17,10 +17,9 @@
 
 #pragma once
 
+#include "ppsspp_config.h"
+
 #include <cstring>
-#ifdef __SYMBIAN32__
-#include <e32std.h>
-#endif
 #ifndef offsetof
 #include <stddef.h>
 #endif
@@ -28,6 +27,7 @@
 // Includes
 #include "Common/Common.h"
 #include "Common/CommonTypes.h"
+#include "Common/Swap.h"
 #include "Core/Opcode.h"
 
 // PPSSPP is very aggressive about trying to do memory accesses directly, for speed.
@@ -82,6 +82,12 @@ extern u8 *m_pUncachedRAM;
 extern u32 g_MemorySize;
 extern u32 g_PSPModel;
 
+// UWP has such limited memory management that we need to mask
+// even in 64-bit mode. Also, when using the sanitizer, we need to mask as well.
+#if PPSSPP_ARCH(32BIT) || PPSSPP_PLATFORM(UWP) || USE_ADDRESS_SANITIZER
+#define MASKED_PSP_MEMORY
+#endif
+
 enum
 {
 	// This may be adjusted by remaster games.
@@ -93,7 +99,7 @@ enum
 
 	SCRATCHPAD_SIZE = 0x00004000,
 
-#if defined(_M_IX86) || defined(_M_ARM32)
+#ifdef MASKED_PSP_MEMORY
 	// This wraparound should work for PSP too.
 	MEMVIEW32_MASK  = 0x3FFFFFFF,
 #endif
@@ -101,16 +107,14 @@ enum
 
 enum {
 	MV_MIRROR_PREVIOUS = 1,
-	// MV_FAKE_VMEM = 2,
-	// MV_WII_ONLY = 4,
 	MV_IS_PRIMARY_RAM = 0x100,
 	MV_IS_EXTRA1_RAM = 0x200,
 	MV_IS_EXTRA2_RAM = 0x400,
+	MV_KERNEL = 0x800  // Can be skipped on platforms where memory is tight.
 };
 
 struct MemoryView
 {
-	u8 **out_ptr_low;
 	u8 **out_ptr;
 	u32 virtual_address;
 	u32 size;
@@ -118,7 +122,7 @@ struct MemoryView
 };
 
 // Uses a memory arena to set up an emulator-friendly memory map
-void MemoryMap_Setup(u32 flags);
+bool MemoryMap_Setup(u32 flags);
 void MemoryMap_Shutdown(u32 flags);
 
 // Init and Shutdown
@@ -126,9 +130,10 @@ void Init();
 void Shutdown();
 void DoState(PointerWrap &p);
 void Clear();
+// False when shutdown has already been called.
+bool IsActive();
 
-class MemoryInitedLock
-{
+class MemoryInitedLock {
 public:
 	MemoryInitedLock();
 	~MemoryInitedLock();
@@ -141,7 +146,7 @@ MemoryInitedLock Lock();
 // used by JIT to read instructions. Does not resolve replacements.
 Opcode Read_Opcode_JIT(const u32 _Address);
 // used by JIT. Reads in the "Locked cache" mode
-void Write_Opcode_JIT(const u32 _Address, const Opcode _Value);
+void Write_Opcode_JIT(const u32 _Address, const Opcode& _Value);
 
 // Should be used by analyzers, disassemblers etc. Does resolve replacements.
 Opcode Read_Instruction(const u32 _Address, bool resolveReplacements = false);
@@ -157,7 +162,7 @@ u64 Read_U64(const u32 _Address);
 #endif
 
 inline u8* GetPointerUnchecked(const u32 address) {
-#if defined(_M_IX86) || defined(_M_ARM32)
+#ifdef MASKED_PSP_MEMORY
 	return (u8 *)(base + (address & MEMVIEW32_MASK));
 #else
 	return (u8 *)(base + address);
@@ -175,15 +180,23 @@ void WriteUnchecked_U32(const u32 _Data, const u32 _Address);
 #else
 
 inline u32 ReadUnchecked_U32(const u32 address) {
-#if defined(_M_IX86) || defined(_M_ARM32)
+#ifdef MASKED_PSP_MEMORY
 	return *(u32_le *)(base + (address & MEMVIEW32_MASK));
 #else
 	return *(u32_le *)(base + address);
 #endif
 }
 
+inline float ReadUnchecked_Float(const u32 address) {
+#ifdef MASKED_PSP_MEMORY
+	return *(float *)(base + (address & MEMVIEW32_MASK));
+#else
+	return *(float *)(base + address);
+#endif
+}
+
 inline u16 ReadUnchecked_U16(const u32 address) {
-#if defined(_M_IX86) || defined(_M_ARM32)
+#ifdef MASKED_PSP_MEMORY
 	return *(u16_le *)(base + (address & MEMVIEW32_MASK));
 #else
 	return *(u16_le *)(base + address);
@@ -191,23 +204,31 @@ inline u16 ReadUnchecked_U16(const u32 address) {
 }
 
 inline u8 ReadUnchecked_U8(const u32 address) {
-#if defined(_M_IX86) || defined(_M_ARM32)
-	return (*(u8 *)(base + (address & MEMVIEW32_MASK))); 
+#ifdef MASKED_PSP_MEMORY
+	return (*(u8 *)(base + (address & MEMVIEW32_MASK)));
 #else
 	return (*(u8 *)(base + address));
 #endif
 }
 
 inline void WriteUnchecked_U32(u32 data, u32 address) {
-#if defined(_M_IX86) || defined(_M_ARM32)
+#ifdef MASKED_PSP_MEMORY
 	*(u32_le *)(base + (address & MEMVIEW32_MASK)) = data;
 #else
 	*(u32_le *)(base + address) = data;
 #endif
 }
 
+inline void WriteUnchecked_Float(float data, u32 address) {
+#ifdef MASKED_PSP_MEMORY
+	*(float *)(base + (address & MEMVIEW32_MASK)) = data;
+#else
+	*(float *)(base + address) = data;
+#endif
+}
+
 inline void WriteUnchecked_U16(u16 data, u32 address) {
-#if defined(_M_IX86) || defined(_M_ARM32)
+#ifdef MASKED_PSP_MEMORY
 	*(u16_le *)(base + (address & MEMVIEW32_MASK)) = data;
 #else
 	*(u16_le *)(base + address) = data;
@@ -215,7 +236,7 @@ inline void WriteUnchecked_U16(u16 data, u32 address) {
 }
 
 inline void WriteUnchecked_U8(u8 data, u32 address) {
-#if defined(_M_IX86) || defined(_M_ARM32)
+#ifdef MASKED_PSP_MEMORY
 	(*(u8 *)(base + (address & MEMVIEW32_MASK))) = data;
 #else
 	(*(u8 *)(base + address)) = data;
@@ -257,64 +278,61 @@ inline const char* GetCharPointer(const u32 address) {
 	return (const char *)GetPointer(address);
 }
 
-void Memset(const u32 _Address, const u8 _Data, const u32 _iLength);
-
-inline void Memcpy(const u32 to_address, const void *from_data, const u32 len)
-{
-	u8 *to = GetPointer(to_address);
-	if (to) {
-		memcpy(to, from_data, len);
-	}
-	// if not, GetPointer will log.
-}
-
-inline void Memcpy(void *to_data, const u32 from_address, const u32 len)
-{
-	const u8 *from = GetPointer(from_address);
-	if (from) {
-		memcpy(to_data, from, len);
-	}
-	// if not, GetPointer will log.
-}
-
 inline void MemcpyUnchecked(void *to_data, const u32 from_address, const u32 len)
 {
 	memcpy(to_data, GetPointerUnchecked(from_address), len);
 }
 
+inline void MemcpyUnchecked(const u32 to_address, const void *from_data, const u32 len)
+{
+	memcpy(GetPointerUnchecked(to_address), from_data, len);
+}
+
+inline void MemcpyUnchecked(const u32 to_address, const u32 from_address, const u32 len)
+{
+	MemcpyUnchecked(GetPointer(to_address), from_address, len);
+}
+
 inline bool IsValidAddress(const u32 address) {
 	if ((address & 0x3E000000) == 0x08000000) {
 		return true;
+	} else if ((address & 0x3F800000) == 0x04000000) {
+		return true;
+	} else if ((address & 0xBFFF0000) == 0x00010000) {
+		return (address & 0x0000FFFF) < SCRATCHPAD_SIZE;
+	} else if ((address & 0x3F000000) >= 0x08000000 && (address & 0x3F000000) < 0x08000000 + g_MemorySize) {
+		return true;
+	} else {
+		return false;
+	}
+}
+
+inline u32 ValidSize(const u32 address, const u32 requested_size) {
+	u32 max_size;
+	if ((address & 0x3E000000) == 0x08000000) {
+		max_size = 0x08000000 + g_MemorySize - address;
 	}
 	else if ((address & 0x3F800000) == 0x04000000) {
-		return true;
+		max_size = 0x04800000 - address;
 	}
 	else if ((address & 0xBFFF0000) == 0x00010000) {
-		return true;
+		max_size = 0x00014000 - address;
 	}
 	else if ((address & 0x3F000000) >= 0x08000000 && (address & 0x3F000000) < 0x08000000 + g_MemorySize) {
-		return true;
+		max_size = 0x08000000 + g_MemorySize - address;
+	} else {
+		max_size = 0;
 	}
-	else
-		return false;
+
+	if (requested_size > max_size) {
+		return max_size;
+	}
+	return requested_size;
 }
 
-
-template<class T>
-void ReadStruct(u32 address, T *ptr)
-{
-	size_t sz = sizeof(*ptr);
-	memcpy(ptr, GetPointer(address), sz);
+inline bool IsValidRange(const u32 address, const u32 size) {
+	return IsValidAddress(address) && ValidSize(address, size) == size;
 }
-
-template<class T>
-void WriteStruct(u32 address, T *ptr)
-{
-	size_t sz = sizeof(*ptr);
-	memcpy(GetPointer(address), ptr, sz);
-}
-
-const char *GetAddressName(u32 address);
 
 };
 
@@ -325,7 +343,7 @@ struct PSPPointer
 
 	inline T &operator*() const
 	{
-#if defined(_M_IX86) || defined(_M_ARM32)
+#ifdef MASKED_PSP_MEMORY
 		return *(T *)(Memory::base + (ptr & Memory::MEMVIEW32_MASK));
 #else
 		return *(T *)(Memory::base + ptr);
@@ -334,7 +352,7 @@ struct PSPPointer
 
 	inline T &operator[](int i) const
 	{
-#if defined(_M_IX86) || defined(_M_ARM32)
+#ifdef MASKED_PSP_MEMORY
 		return *((T *)(Memory::base + (ptr & Memory::MEMVIEW32_MASK)) + i);
 #else
 		return *((T *)(Memory::base + ptr) + i);
@@ -343,7 +361,7 @@ struct PSPPointer
 
 	inline T *operator->() const
 	{
-#if defined(_M_IX86) || defined(_M_ARM32)
+#ifdef MASKED_PSP_MEMORY
 		return (T *)(Memory::base + (ptr & Memory::MEMVIEW32_MASK));
 #else
 		return (T *)(Memory::base + ptr);
@@ -412,7 +430,7 @@ struct PSPPointer
 
 	inline operator T*()
 	{
-#if defined(_M_IX86) || defined(_M_ARM32)
+#ifdef MASKED_PSP_MEMORY
 		return (T *)(Memory::base + (ptr & Memory::MEMVIEW32_MASK));
 #else
 		return (T *)(Memory::base + ptr);
@@ -421,7 +439,7 @@ struct PSPPointer
 
 	inline operator const T*() const
 	{
-#if defined(_M_IX86) || defined(_M_ARM32)
+#ifdef MASKED_PSP_MEMORY
 		return (const T *)(Memory::base + (ptr & Memory::MEMVIEW32_MASK));
 #else
 		return (const T *)(Memory::base + ptr);

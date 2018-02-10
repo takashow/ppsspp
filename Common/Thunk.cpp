@@ -21,12 +21,11 @@
 
 #define THUNK_ARENA_SIZE 1024*1024*1
 
-namespace
-{
+namespace {
 
 #ifndef _M_X64
-static u8 GC_ALIGNED32(saved_fp_state[16 * 4 * 4]);
-static u8 GC_ALIGNED32(saved_gpr_state[16 * 8]);
+alignas(32) static u8 saved_fp_state[16 * 4 * 4];
+alignas(32) static u8 saved_gpr_state[16 * 8];
 static u16 saved_mxcsr;
 #endif
 
@@ -43,6 +42,7 @@ void ThunkManager::Init()
 #endif
 
 	AllocCodeSpace(THUNK_ARENA_SIZE);
+	BeginWrite();
 	save_regs = GetCodePtr();
 #ifdef _M_X64
 	for (int i = 2; i < ABI_GetNumXMMRegs(); i++)
@@ -94,12 +94,13 @@ void ThunkManager::Init()
 	MOV(32, R(RDX), M(saved_gpr_state + 4 ));
 #endif
 	RET();
+	EndWrite();
 }
 
 void ThunkManager::Reset()
 {
 	thunks.clear();
-	ResetCodePtr();
+	ResetCodePtr(0);
 }
 
 void ThunkManager::Shutdown()
@@ -141,8 +142,7 @@ int ThunkManager::ThunkStackOffset()
 #endif
 }
 
-const void *ThunkManager::ProtectFunction(const void *function, int num_params)
-{
+const void *ThunkManager::ProtectFunction(const void *function, int num_params) {
 	std::map<const void *, const u8 *>::iterator iter;
 	iter = thunks.find(function);
 	if (iter != thunks.end())
@@ -150,6 +150,7 @@ const void *ThunkManager::ProtectFunction(const void *function, int num_params)
 	if (!region)
 		PanicAlert("Trying to protect functions before the emu is started. Bad bad bad.");
 
+	BeginWrite();
 	const u8 *call_point = GetCodePtr();
 	Enter(this, true);
 
@@ -171,6 +172,7 @@ const void *ThunkManager::ProtectFunction(const void *function, int num_params)
 
 	Leave(this, true);
 	RET();
+	EndWrite();
 
 	thunks[function] = call_point;
 	return (const void *)call_point;

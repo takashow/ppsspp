@@ -18,12 +18,12 @@
 #pragma once
 
 #include "CommonTypes.h"
+#include "GPU/Common/DrawEngineCommon.h"
 #include "GPU/Common/GPUDebugInterface.h"
 #include "GPU/Math3D.h"
 
 using namespace Math3D;
 
-typedef u16 fixed16;
 typedef u16 u10; // TODO: erm... :/
 
 typedef Vec3<float> ModelCoords;
@@ -36,17 +36,17 @@ struct SplinePatch;
 struct ScreenCoords
 {
 	ScreenCoords() {}
-	ScreenCoords(fixed16 x, fixed16 y, u16 z) : x(x), y(y), z(z) {}
+	ScreenCoords(int x, int y, u16 z) : x(x), y(y), z(z) {}
 
-	fixed16 x;
-	fixed16 y;
+	int x;
+	int y;
 	u16 z;
 
-	Vec2<fixed16> xy() const { return Vec2<fixed16>(x, y); }
+	Vec2<int> xy() const { return Vec2<int>(x, y); }
 
 	ScreenCoords operator * (const float t) const
 	{
-		return ScreenCoords((fixed16)(x * t), (fixed16)(y * t), (u16)(z * t));
+		return ScreenCoords((int)(x * t), (int)(y * t), (u16)(z * t));
 	}
 
 	ScreenCoords operator / (const int t) const
@@ -63,17 +63,17 @@ struct ScreenCoords
 struct DrawingCoords
 {
 	DrawingCoords() {}
-	DrawingCoords(u10 x, u10 y, u16 z) : x(x), y(y), z(z) {}
+	DrawingCoords(s16 x, s16 y, u16 z) : x(x), y(y), z(z) {}
 
-	u10 x;
-	u10 y;
+	s16 x;
+	s16 y;
 	u16 z;
 
-	Vec2<u10> xy() const { return Vec2<u10>(x, y); }
+	Vec2<s16> xy() const { return Vec2<s16>(x, y); }
 
 	DrawingCoords operator * (const float t) const
 	{
-		return DrawingCoords((u10)(x * t), (u10)(y * t), (u16)(z * t));
+		return DrawingCoords((s16)(x * t), (s16)(y * t), (u16)(z * t));
 	}
 
 	DrawingCoords operator + (const DrawingCoords& oth) const
@@ -93,8 +93,9 @@ struct VertexData
 		screenpos = ::Lerp(a.screenpos, b.screenpos, t);  // TODO: Should use a LerpInt (?)
 		texturecoords = ::Lerp(a.texturecoords, b.texturecoords, t);
 		normal = ::Lerp(a.normal, b.normal, t);
+		fogdepth = ::Lerp(a.fogdepth, b.fogdepth, t);
 
-		u16 t_int =(u16)(t*256);
+		u16 t_int = (u16)(t*256);
 		color0 = LerpInt<Vec4<int>,256>(a.color0, b.color0, t_int);
 		color1 = LerpInt<Vec3<int>,256>(a.color1, b.color1, t_int);
 	}
@@ -108,11 +109,18 @@ struct VertexData
 	WorldCoords worldnormal;
 	Vec4<int> color0;
 	Vec3<int> color1;
+	float fogdepth;
 };
 
-class TransformUnit
-{
+class VertexReader;
+
+class SoftwareDrawEngine;
+
+class TransformUnit {
 public:
+	TransformUnit();
+	~TransformUnit();
+
 	static WorldCoords ModelToWorldNormal(const ModelCoords& coords);
 	static WorldCoords ModelToWorld(const ModelCoords& coords);
 	static ViewCoords WorldToView(const WorldCoords& coords);
@@ -121,11 +129,24 @@ public:
 	static DrawingCoords ScreenToDrawing(const ScreenCoords& coords);
 	static ScreenCoords DrawingToScreen(const DrawingCoords& coords);
 
-	static void SubmitSpline(void* control_points, void* indices, int count_u, int count_v, int type_u, int type_v, GEPatchPrimType prim_type, u32 vertex_type);
-	static void SubmitPrimitive(void* vertices, void* indices, u32 prim_type, int vertex_count, u32 vertex_type, int *bytesRead);
+	void SubmitPrimitive(void* vertices, void* indices, GEPrimitiveType prim_type, int vertex_count, u32 vertex_type, int *bytesRead, SoftwareDrawEngine *drawEngine);
 
-	static bool GetCurrentSimpleVertices(int count, std::vector<GPUDebugVertex> &vertices, std::vector<u16> &indices);
+	bool GetCurrentSimpleVertices(int count, std::vector<GPUDebugVertex> &vertices, std::vector<u16> &indices);
+	VertexData ReadVertex(VertexReader& vreader);
 
-	static SplinePatch *patchBuffer_;
-	static int patchBufferSize_;
+	bool outside_range_flag = false;
+	u8 *buf;
+};
+
+class SoftwareDrawEngine : public DrawEngineCommon {
+public:
+	SoftwareDrawEngine();
+	~SoftwareDrawEngine();
+
+	void DispatchFlush() override;
+	void DispatchSubmitPrim(void *verts, void *inds, GEPrimitiveType prim, int vertexCount, u32 vertType, int *bytesRead) override;
+
+	VertexDecoder *FindVertexDecoder(u32 vtype);
+
+	TransformUnit transformUnit;
 };

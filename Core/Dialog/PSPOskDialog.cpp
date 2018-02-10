@@ -22,6 +22,7 @@
 #include "Core/Dialog/PSPOskDialog.h"
 #include "Core/Util/PPGeDraw.h"
 #include "Core/HLE/sceCtrl.h"
+#include "Core/HLE/sceDisplay.h"
 #include "Core/HLE/sceUtility.h"
 #include "Core/Config.h"
 #include "Core/Reporting.h"
@@ -51,7 +52,7 @@ const int numKeyRows[OSK_KEYBOARD_COUNT] = {4, 4, 5, 5, 5, 4, 4, 4, 4};
 static const wchar_t diacritics[2][103] =
 {
 	{L"かがきぎくぐけげこごさざしじすずせぜそぞただちぢつづてでとどはばぱばひびぴびふぶぷぶへべぺべほぼぽぼウヴカガキギクグケゲコゴサザシジスズセゼソゾタダチヂツヅテデトドハバパバヒビピビフブプブヘベペベホボポボ"},
-	{L"はぱばぱひぴびぴふぷぶぷへぱべぱほぽぼぽハパバパヒピビピフプブプヘパベパホポボポ"}
+	{L"はぱばぱひぴびぴふぷぶぷへぺべぺほぽぼぽハパバパヒピビピフプブプヘペベペホポボポ"}
 };
 
 // Korean (Hangul) consonant
@@ -142,6 +143,18 @@ static const wchar_t oskKeys[OSK_KEYBOARD_COUNT][5][14] =
 	},
 };
 
+// This isn't a complete representation of these flags, it just helps ensure we show the right keyboards.
+int allowedInputFlagsMap[OSK_KEYBOARD_COUNT] = {
+	PSP_UTILITY_OSK_INPUTTYPE_LATIN_LOWERCASE | PSP_UTILITY_OSK_INPUTTYPE_LATIN_SYMBOL | PSP_UTILITY_OSK_INPUTTYPE_LATIN_DIGIT,
+	PSP_UTILITY_OSK_INPUTTYPE_LATIN_UPPERCASE | PSP_UTILITY_OSK_INPUTTYPE_LATIN_SYMBOL,
+	PSP_UTILITY_OSK_INPUTTYPE_JAPANESE_HIRAGANA,
+	PSP_UTILITY_OSK_INPUTTYPE_JAPANESE_KATAKANA | PSP_UTILITY_OSK_INPUTTYPE_JAPANESE_HALF_KATAKANA,
+	PSP_UTILITY_OSK_INPUTTYPE_KOREAN,
+	PSP_UTILITY_OSK_INPUTTYPE_RUSSIAN_LOWERCASE,
+	PSP_UTILITY_OSK_INPUTTYPE_RUSSIAN_UPPERCASE,
+	PSP_UTILITY_OSK_INPUTTYPE_JAPANESE_LOWERCASE | PSP_UTILITY_OSK_INPUTTYPE_JAPANESE_SYMBOL | PSP_UTILITY_OSK_INPUTTYPE_JAPANESE_DIGIT,
+	PSP_UTILITY_OSK_INPUTTYPE_JAPANESE_UPPERCASE | PSP_UTILITY_OSK_INPUTTYPE_JAPANESE_SYMBOL,
+};
 
 PSPOskDialog::PSPOskDialog() : PSPDialog() {
 	// This can break all kinds of stuff, changing the decimal point in sprintf for example.
@@ -152,7 +165,7 @@ PSPOskDialog::PSPOskDialog() : PSPDialog() {
 PSPOskDialog::~PSPOskDialog() {
 }
 
-void PSPOskDialog::ConvertUCS2ToUTF8(std::string& _string, const PSPPointer<u16_le> em_address)
+void PSPOskDialog::ConvertUCS2ToUTF8(std::string& _string, const PSPPointer<u16_le>& em_address)
 {
 	if (!em_address.IsValid())
 	{
@@ -160,12 +173,13 @@ void PSPOskDialog::ConvertUCS2ToUTF8(std::string& _string, const PSPPointer<u16_
 		return;
 	}
 
-	char stringBuffer[2048];
+	const size_t maxLength = 2047;
+	char stringBuffer[maxLength + 1];
 	char *string = stringBuffer;
 
-	auto input = em_address;
+	u16_le *input = &em_address[0];
 	int c;
-	while ((c = *input++) != 0)
+	while ((c = *input++) != 0 && string < stringBuffer + maxLength)
 	{
 		if (c < 0x80)
 			*string++ = c;
@@ -182,28 +196,22 @@ void PSPOskDialog::ConvertUCS2ToUTF8(std::string& _string, const PSPPointer<u16_
 	_string = stringBuffer;
 }
 
-void GetWideStringFromPSPPointer(std::wstring& _string, const PSPPointer<u16_le> em_address)
+void GetWideStringFromPSPPointer(std::wstring& _string, const PSPPointer<u16_le>& em_address)
 {
 	if (!em_address.IsValid())
 	{
 		_string = L"";
 		return;
 	}
-	const size_t maxLength = 2048;
 
-	wchar_t stringBuffer[maxLength];
+	const size_t maxLength = 2047;
+	wchar_t stringBuffer[maxLength + 1];
 	wchar_t *string = stringBuffer;
 
-	auto input = em_address;
+	u16_le *input = &em_address[0];
 	int c;
-	u32 count = 0;
-	while ((c = *input++) != 0)
-	{
-		if ( !(++count >= maxLength) )
-			*string++ = c;
-		else
-			break;
-	}
+	while ((c = *input++) != 0 && string < stringBuffer + maxLength)
+		*string++ = c;
 	*string++ = '\0';
 	_string = stringBuffer;
 }
@@ -229,6 +237,42 @@ void PSPOskDialog::ConvertUCS2ToUTF8(std::string& _string, const wchar_t *input)
 	}
 	*string++ = '\0';
 	_string = stringBuffer;
+}
+
+static void FindValidKeyboard(s32 inputType, int direction, OskKeyboardLanguage &lang, OskKeyboardDisplay &disp) {
+	OskKeyboardLanguage origLang = lang;
+	OskKeyboardDisplay origDisp = disp;
+
+	if (inputType == 0) {
+		return;
+	}
+
+	// TODO: Limit by allowed keyboards properly... this is just an approximation.
+	int tries = OSK_LANGUAGE_COUNT * 2;
+	while (!(inputType & allowedInputFlagsMap[disp]) && tries > 0) {
+		if ((--tries % 1) == 0) {
+			lang = (OskKeyboardLanguage)((OSK_LANGUAGE_COUNT + lang + direction) % OSK_LANGUAGE_COUNT);
+			disp = OskKeyboardCases[lang][LOWERCASE];
+		} else {
+			disp = OskKeyboardCases[lang][UPPERCASE];
+		}
+	}
+
+	if (tries == 0) {
+		// In case of error, let's just fall back to allowing all.
+		lang = origLang;
+		disp = origDisp;
+	}
+}
+
+static bool IsKeyboardShiftValid(s32 inputType, OskKeyboardLanguage lang, OskKeyboardDisplay disp) {
+	// Swap disp and check if it's valid.
+	if (disp == OskKeyboardCases[lang][UPPERCASE])
+		disp = OskKeyboardCases[lang][LOWERCASE];
+	else
+		disp = OskKeyboardCases[lang][UPPERCASE];
+
+	return inputType == 0 || (inputType & allowedInputFlagsMap[disp]) != 0;
 }
 
 int PSPOskDialog::Init(u32 oskPtr) {
@@ -263,8 +307,9 @@ int PSPOskDialog::Init(u32 oskPtr) {
 
 	ChangeStatusInit(OSK_INIT_DELAY_US);
 	selectedChar = 0;
-	currentKeyboard = OSK_KEYBOARD_LATIN_LOWERCASE;
 	currentKeyboardLanguage = OSK_LANGUAGE_ENGLISH;
+	currentKeyboard = OSK_KEYBOARD_LATIN_LOWERCASE;
+	FindValidKeyboard(oskParams->fields[0].inputtype, 1, currentKeyboardLanguage, currentKeyboard);
 
 	ConvertUCS2ToUTF8(oskDesc, oskParams->fields[0].desc);
 	ConvertUCS2ToUTF8(oskIntext, oskParams->fields[0].intext);
@@ -746,7 +791,7 @@ void PSPOskDialog::RenderKeyboard()
 
 				if(isCombinated == true)
 				{
-					float animStep = (float)(gpuStats.numVBlanks % 40) / 20.0f;
+					float animStep = (float)(__DisplayGetNumVblanks() % 40) / 20.0f;
 					// Fade in and out the next character so they know it's not part of the string yet.
 					u32 alpha = (0.5f - (cosf(animStep * M_PI) / 2.0f)) * 128 + 127;
 					color = CalcFadedColor((alpha << 24) | 0xFFFFFF);
@@ -872,10 +917,10 @@ int PSPOskDialog::Update(int animSpeed) {
 	PPGeDrawRect(0, 0, 480, 272, CalcFadedColor(0x63636363));
 	RenderKeyboard();
 
-	I18NCategory *d = GetI18NCategory("Dialog");
+	I18NCategory *di = GetI18NCategory("Dialog");
 
 	PPGeDrawImage(I_SQUARE, 365, 222, 16, 16, 0, CalcFadedColor(0xFFFFFFFF));
-	PPGeDrawText(d->T("Space"), 390, 222, PPGE_ALIGN_LEFT, 0.5f, CalcFadedColor(0xFFFFFFFF));
+	PPGeDrawText(di->T("Space"), 390, 222, PPGE_ALIGN_LEFT, 0.5f, CalcFadedColor(0xFFFFFFFF));
 
 	if (g_Config.iButtonPreference != PSP_SYSTEMPARAM_BUTTON_CIRCLE) {
 		PPGeDrawImage(I_CROSS, 45, 222, 16, 16, 0, CalcFadedColor(0xFFFFFFFF));
@@ -885,43 +930,49 @@ int PSPOskDialog::Update(int animSpeed) {
 		PPGeDrawImage(I_CROSS, 45, 247, 16, 16, 0, CalcFadedColor(0xFFFFFFFF));
 	}
 
-	PPGeDrawText(d->T("Select"), 75, 222, PPGE_ALIGN_LEFT, 0.5f, CalcFadedColor(0xFFFFFFFF));
-	PPGeDrawText(d->T("Delete"), 75, 247, PPGE_ALIGN_LEFT, 0.5f, CalcFadedColor(0xFFFFFFFF));
+	PPGeDrawText(di->T("Select"), 75, 222, PPGE_ALIGN_LEFT, 0.5f, CalcFadedColor(0xFFFFFFFF));
+	PPGeDrawText(di->T("Delete"), 75, 247, PPGE_ALIGN_LEFT, 0.5f, CalcFadedColor(0xFFFFFFFF));
 
 	PPGeDrawText("Start", 135, 220, PPGE_ALIGN_LEFT, 0.6f, CalcFadedColor(0xFFFFFFFF));
-	PPGeDrawText(d->T("Finish"), 185, 222, PPGE_ALIGN_LEFT, 0.5f, CalcFadedColor(0xFFFFFFFF));
+	PPGeDrawText(di->T("Finish"), 185, 222, PPGE_ALIGN_LEFT, 0.5f, CalcFadedColor(0xFFFFFFFF));
 
-	int index = (currentKeyboardLanguage - 1) % OSK_LANGUAGE_COUNT;
-	const char *countryCode;
+	auto lookupLangName = [&](int direction) {
+		// First, find the valid one...
+		OskKeyboardLanguage lang = (OskKeyboardLanguage)((OSK_LANGUAGE_COUNT + currentKeyboardLanguage + direction) % OSK_LANGUAGE_COUNT);
+		OskKeyboardDisplay disp = OskKeyboardCases[lang][LOWERCASE];
+		FindValidKeyboard(oskParams->fields[0].inputtype, direction, lang, disp);
 
-	if (index >= 0)
-		countryCode = OskKeyboardNames[(currentKeyboardLanguage - 1) % OSK_LANGUAGE_COUNT].c_str();
-	else
-		countryCode = OskKeyboardNames[OSK_LANGUAGE_COUNT - 1].c_str();
+		if (lang == currentKeyboardLanguage) {
+			return (const char *)nullptr;
+		}
 
-	const char *language = languageMapping[countryCode].first.c_str();
+		// Now, let's grab the name.
+		const char *countryCode = OskKeyboardNames[lang].c_str();
+		const char *language = languageMapping[countryCode].first.c_str();
 
-	if (!strcmp(countryCode, "English Full-width"))
-		language = "English Full-width";
-			
-	countryCode = OskKeyboardNames[currentKeyboardLanguage].c_str();
-		
-	if (strcmp(countryCode, "ko_KR")) {
+		// It seems like this is a "fake" country code for extra keyboard purposes.
+		if (!strcmp(countryCode, "English Full-width"))
+			language = "English Full-width";
+
+		return language;
+	};
+
+	if (OskKeyboardNames[currentKeyboardLanguage] != "ko_KR" && IsKeyboardShiftValid(oskParams->fields[0].inputtype, currentKeyboardLanguage, currentKeyboard)) {
 		PPGeDrawText("Select", 135, 245, PPGE_ALIGN_LEFT, 0.6f, CalcFadedColor(0xFFFFFFFF));
-		PPGeDrawText(d->T("Shift"), 185, 247, PPGE_ALIGN_LEFT, 0.5f, CalcFadedColor(0xFFFFFFFF));
+		PPGeDrawText(di->T("Shift"), 185, 247, PPGE_ALIGN_LEFT, 0.5f, CalcFadedColor(0xFFFFFFFF));
 	}
-		
-	PPGeDrawText("L", 235, 220, PPGE_ALIGN_LEFT, 0.6f, CalcFadedColor(0xFFFFFFFF));
-	PPGeDrawText(language, 255, 222, PPGE_ALIGN_LEFT, 0.5f, CalcFadedColor(0xFFFFFFFF));
 
-	countryCode = OskKeyboardNames[(currentKeyboardLanguage + 1) % OSK_LANGUAGE_COUNT].c_str();
-	language = languageMapping[countryCode].first.c_str();
+	const char *prevLang = lookupLangName(-1);
+	if (prevLang) {
+		PPGeDrawText("L", 235, 220, PPGE_ALIGN_LEFT, 0.6f, CalcFadedColor(0xFFFFFFFF));
+		PPGeDrawText(prevLang, 255, 222, PPGE_ALIGN_LEFT, 0.5f, CalcFadedColor(0xFFFFFFFF));
+	}
 
-	if (!strcmp(countryCode, "English Full-width"))
-		language = "English Full-width";
-
-	PPGeDrawText("R", 235, 245, PPGE_ALIGN_LEFT, 0.6f, CalcFadedColor(0xFFFFFFFF));
-	PPGeDrawText(language, 255, 247, PPGE_ALIGN_LEFT, 0.5f, CalcFadedColor(0xFFFFFFFF));		
+	const char *nextLang = lookupLangName(1);
+	if (nextLang) {
+		PPGeDrawText("R", 235, 245, PPGE_ALIGN_LEFT, 0.6f, CalcFadedColor(0xFFFFFFFF));
+		PPGeDrawText(nextLang, 255, 247, PPGE_ALIGN_LEFT, 0.5f, CalcFadedColor(0xFFFFFFFF));
+	}
 
 	if (IsButtonPressed(CTRL_UP) || IsButtonHeld(CTRL_UP, upBtnFramesHeld, framesHeldThreshold, framesHeldRepeatRate)) {
 		selectedChar -= numKeyCols[currentKeyboard];
@@ -943,10 +994,12 @@ int PSPOskDialog::Update(int animSpeed) {
 		inputChars = CombinationString(true);
 	} else if (IsButtonPressed(CTRL_SELECT)) {
 		// Select now swaps case.
-		if (currentKeyboard == OskKeyboardCases[currentKeyboardLanguage][UPPERCASE])
-			currentKeyboard = OskKeyboardCases[currentKeyboardLanguage][LOWERCASE];
-		else
-			currentKeyboard = OskKeyboardCases[currentKeyboardLanguage][UPPERCASE];
+		if (IsKeyboardShiftValid(oskParams->fields[0].inputtype, currentKeyboardLanguage, currentKeyboard)) {
+			if (currentKeyboard == OskKeyboardCases[currentKeyboardLanguage][UPPERCASE])
+				currentKeyboard = OskKeyboardCases[currentKeyboardLanguage][LOWERCASE];
+			else
+				currentKeyboard = OskKeyboardCases[currentKeyboardLanguage][UPPERCASE];
+		}
 
 		if (selectedRow >= numKeyRows[currentKeyboard]) {
 			selectedRow = numKeyRows[currentKeyboard] - 1;
@@ -958,10 +1011,10 @@ int PSPOskDialog::Update(int animSpeed) {
 
 		selectedChar = selectedRow * numKeyCols[currentKeyboard] + selectedExtra;
 	} else if (IsButtonPressed(CTRL_RTRIGGER)) {
-		// TODO: Limit by allowed keyboards...
 		// RTRIGGER now cycles languages forward.
 		currentKeyboardLanguage = (OskKeyboardLanguage)((currentKeyboardLanguage + 1) % OSK_LANGUAGE_COUNT);
 		currentKeyboard = OskKeyboardCases[currentKeyboardLanguage][LOWERCASE];
+		FindValidKeyboard(oskParams->fields[0].inputtype, 1, currentKeyboardLanguage, currentKeyboard);
 
 		if (selectedRow >= numKeyRows[currentKeyboard]) {
 			selectedRow = numKeyRows[currentKeyboard] - 1;
@@ -973,14 +1026,13 @@ int PSPOskDialog::Update(int animSpeed) {
 
 		selectedChar = selectedRow * numKeyCols[currentKeyboard] + selectedExtra;
 	} else if (IsButtonPressed(CTRL_LTRIGGER)) {
-		// TODO: Limit by allowed keyboards...
 		// LTRIGGER now cycles languages backward.
 		if (currentKeyboardLanguage - 1 >= 0)
 			currentKeyboardLanguage = (OskKeyboardLanguage)((currentKeyboardLanguage - 1) % OSK_LANGUAGE_COUNT);
 		else
 			currentKeyboardLanguage = (OskKeyboardLanguage)(OSK_LANGUAGE_COUNT - 1);
-
 		currentKeyboard = OskKeyboardCases[currentKeyboardLanguage][LOWERCASE];
+		FindValidKeyboard(oskParams->fields[0].inputtype, -1, currentKeyboardLanguage, currentKeyboard);
 
 		if (selectedRow >= numKeyRows[currentKeyboard]) {
 			selectedRow = numKeyRows[currentKeyboard] - 1;

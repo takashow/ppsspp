@@ -24,32 +24,38 @@
 #include "input/keycodes.h"
 #include "ui/screen.h"
 #include "ui/ui_screen.h"
+#include "ui/ui_tween.h"
 #include "Common/KeyMap.h"
 
 struct AxisInput;
+
+class AsyncImageFileView;
 
 class EmuScreen : public UIScreen {
 public:
 	EmuScreen(const std::string &filename);
 	~EmuScreen();
 
-	virtual void update(InputState &input) override;
-	virtual void render() override;
-	virtual void deviceLost() override;
-	virtual void dialogFinished(const Screen *dialog, DialogResult result) override;
-	virtual void sendMessage(const char *msg, const char *value) override;
+	void update() override;
+	void render() override;
+	void preRender() override;
+	void postRender() override;
+	void dialogFinished(const Screen *dialog, DialogResult result) override;
+	void sendMessage(const char *msg, const char *value) override;
+	void resized() override;
 
-	virtual bool touch(const TouchInput &touch) override;
-	virtual bool key(const KeyInput &key) override;
-	virtual bool axis(const AxisInput &axis) override;
+	bool touch(const TouchInput &touch) override;
+	bool key(const KeyInput &key) override;
+	bool axis(const AxisInput &axis) override;
 
 protected:
-	virtual void CreateViews();
+	void CreateViews() override;
 	UI::EventReturn OnDevTools(UI::EventParams &params);
 
 private:
 	void bootGame(const std::string &filename);
 	void bootComplete();
+	void renderUI();
 	void processAxis(const AxisInput &axis, int direction);
 
 	void pspKey(int pspKeyCode, int flags);
@@ -58,8 +64,12 @@ private:
 	void setVKeyAnalogX(int stick, int virtualKeyMin, int virtualKeyMax);
 	void setVKeyAnalogY(int stick, int virtualKeyMin, int virtualKeyMax);
 
+	void releaseButtons();
+
 	void autoLoad();
 	void checkPowerDown();
+
+	UI::Event OnDevMenu;
 
 	bool bootPending_;
 	std::string gamePath_;
@@ -67,6 +77,7 @@ private:
 	// Something invalid was loaded, don't try to emulate
 	bool invalid_;
 	bool quit_;
+	bool stopRender_ = false;
 	std::string errorMessage_;
 
 	// If set, pauses at the end of the frame.
@@ -82,4 +93,13 @@ private:
 
 	// De-noise mapped axis updates
 	int axisState_[JOYSTICK_AXIS_MAX];
+
+	double saveStatePreviewShownTime_;
+	AsyncImageFileView *saveStatePreview_;
+	int saveStateSlot_;
+
+	UI::View *loadingView_ = nullptr;
+	UI::CallbackColorTween *loadingViewColor_ = nullptr;
+	UI::VisibilityTween *loadingViewVisible_ = nullptr;
+	UI::Spinner *loadingSpinner_ = nullptr;
 };

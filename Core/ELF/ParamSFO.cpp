@@ -20,7 +20,9 @@
 
 #include "Common/CommonTypes.h"
 #include "Common/Log.h"
+#include "Common/StringUtils.h"
 #include "Core/ELF/ParamSFO.h"
+#include "Core/Core.h"
 
 struct Header
 {
@@ -40,42 +42,36 @@ struct IndexTable
 	u32 data_table_offset; /* Offset of the param_data from start of data_table */
 };
 
-void ParamSFOData::SetValue(std::string key, unsigned int value, int max_size)
-{
+void ParamSFOData::SetValue(std::string key, unsigned int value, int max_size) {
 	values[key].type = VT_INT;
 	values[key].i_value = value;
 	values[key].max_size = max_size;
 }
-void ParamSFOData::SetValue(std::string key, std::string value, int max_size)
-{
+void ParamSFOData::SetValue(std::string key, std::string value, int max_size) {
 	values[key].type = VT_UTF8;
 	values[key].s_value = value;
 	values[key].max_size = max_size;
 }
 
-void ParamSFOData::SetValue(std::string key, const u8* value, unsigned int size, int max_size)
-{
+void ParamSFOData::SetValue(std::string key, const u8* value, unsigned int size, int max_size) {
 	values[key].type = VT_UTF8_SPE;
 	values[key].SetData(value,size);
 	values[key].max_size = max_size;
 }
 
-int ParamSFOData::GetValueInt(std::string key)
-{
+int ParamSFOData::GetValueInt(std::string key) {
 	std::map<std::string,ValueData>::iterator it = values.find(key);
 	if(it == values.end() || it->second.type != VT_INT)
 		return 0;
 	return it->second.i_value;
 }
-std::string ParamSFOData::GetValueString(std::string key)
-{
+std::string ParamSFOData::GetValueString(std::string key) {
 	std::map<std::string,ValueData>::iterator it = values.find(key);
 	if(it == values.end() || (it->second.type != VT_UTF8))
 		return "";
 	return it->second.s_value;
 }
-u8* ParamSFOData::GetValueData(std::string key, unsigned int *size)
-{
+u8* ParamSFOData::GetValueData(std::string key, unsigned int *size) {
 	std::map<std::string,ValueData>::iterator it = values.find(key);
 	if(it == values.end() || (it->second.type != VT_UTF8_SPE))
 		return 0;
@@ -86,9 +82,16 @@ u8* ParamSFOData::GetValueData(std::string key, unsigned int *size)
 	return it->second.u_value;
 }
 
+std::vector<std::string> ParamSFOData::GetKeys() {
+	std::vector<std::string> result;
+	for (const auto &pair : values) {
+		result.push_back(pair.first);
+	}
+	return result;
+}
+
 // I'm so sorry Ced but this is highly endian unsafe :(
-bool ParamSFOData::ReadSFO(const u8 *paramsfo, size_t size)
-{
+bool ParamSFOData::ReadSFO(const u8 *paramsfo, size_t size) {
 	if (size < sizeof(Header))
 		return false;
 	const Header *header = (const Header *)paramsfo;
@@ -137,8 +140,7 @@ bool ParamSFOData::ReadSFO(const u8 *paramsfo, size_t size)
 	return true;
 }
 
-int ParamSFOData::GetDataOffset(const u8 *paramsfo, std::string dataName)
-{
+int ParamSFOData::GetDataOffset(const u8 *paramsfo, std::string dataName) {
 	const Header *header = (const Header *)paramsfo;
 	if (header->magic != 0x46535000)
 		return -1;
@@ -162,8 +164,7 @@ int ParamSFOData::GetDataOffset(const u8 *paramsfo, std::string dataName)
 	return -1;
 }
 
-bool ParamSFOData::WriteSFO(u8 **paramsfo, size_t *size)
-{
+bool ParamSFOData::WriteSFO(u8 **paramsfo, size_t *size) {
 	size_t total_size = 0;
 	size_t key_size = 0;
 	size_t data_size = 0;
@@ -176,7 +177,7 @@ bool ParamSFOData::WriteSFO(u8 **paramsfo, size_t *size)
 	total_size += sizeof(Header);
 
 	// Get size info
-	for (std::map<std::string,ValueData>::iterator it = values.begin(); it != values.end(); it++)
+	for (auto it = values.begin(); it != values.end(); ++it)
 	{
 		key_size += it->first.size()+1;
 		data_size += it->second.max_size;
@@ -205,7 +206,7 @@ bool ParamSFOData::WriteSFO(u8 **paramsfo, size_t *size)
 	u8* key_ptr = data + header.key_table_start;
 	u8* data_ptr = data + header.data_table_start;
 
-	for (std::map<std::string,ValueData>::iterator it = values.begin(); it != values.end(); it++)
+	for (auto it = values.begin(); it != values.end(); ++it)
 	{
 		u16 offset = (u16)(key_ptr - (data+header.key_table_start));
 		index_ptr->key_table_offset = offset;
@@ -246,12 +247,13 @@ bool ParamSFOData::WriteSFO(u8 **paramsfo, size_t *size)
 	}
 
 	return true;
-
-
 }
 
-void ParamSFOData::ValueData::SetData(const u8* data, int size)
-{
+void ParamSFOData::Clear() {
+	values.clear();
+}
+
+void ParamSFOData::ValueData::SetData(const u8* data, int size) {
 	if(u_value)
 	{
 		delete[] u_value;
@@ -265,3 +267,27 @@ void ParamSFOData::ValueData::SetData(const u8* data, int size)
 	u_size = size;
 }
 
+std::string ParamSFOData::GenerateFakeID(std::string filename) {
+	// Generates fake gameID for homebrew based on it's folder name.
+	// Should probably not be a part of ParamSFO, but it'll be called in same places.
+	std::string file = PSP_CoreParameter().fileToStart;
+	if (filename != "")
+		file = filename;
+
+	std::size_t lslash = file.find_last_of("/");
+	file = file.substr(lslash + 1);
+
+	int sumOfAllLetters = 0;
+	for (char &c : file) {
+		sumOfAllLetters += c;
+		c = toupper(c);
+	}
+
+	if (file.size() < 4) {
+		file += "HOME";
+	}
+	file = file.substr(0, 4);
+
+	std::string fakeID = file + StringFromFormat("%05d", sumOfAllLetters);
+	return fakeID;
+}

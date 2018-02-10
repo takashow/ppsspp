@@ -17,7 +17,7 @@
 
 #pragma once
 
-#include "StubHost.h"
+#include "headless/StubHost.h"
 
 #undef HEADLESSHOST_CLASS
 #define HEADLESSHOST_CLASS WindowsHeadlessHost
@@ -28,22 +28,18 @@
 class WindowsHeadlessHost : public HeadlessHost
 {
 public:
-	virtual bool InitGraphics(std::string *error_message) override;
-	virtual void ShutdownGraphics() override;
+	bool InitGraphics(std::string *error_message, GraphicsContext **ctx) override;
+	void ShutdownGraphics() override;
 
-	virtual void SwapBuffers() override;
+	void SwapBuffers() override;
 
-	virtual void SendDebugOutput(const std::string &output) override;
-	virtual void SendDebugScreenshot(const u8 *pixbuf, u32 w, u32 h) override;
-	virtual void SetComparisonScreenshot(const std::string &filename) override;
+	void SendDebugOutput(const std::string &output) override;
 
 protected:
-	virtual bool ResizeGL();
 	void LoadNativeAssets();
-	void SendOrCollectDebugOutput(const std::string &output);
 
 	HWND hWnd;
 	HDC hDC;
 	HGLRC hRC;
-	std::string comparisonScreenshot;
+	GraphicsContext *gfx_;
 };

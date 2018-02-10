@@ -18,37 +18,37 @@
 #pragma once
 
 #include <map>
+#include <unordered_map>
 #include <vector>
 #include <string>
 
 #include "Common/CommonTypes.h"
+#include "Common/CodeBlock.h"
 #include "Core/MIPS/MIPSAnalyst.h"
 #include "Core/MIPS/MIPS.h"
 
-#if defined(ARM)
-#include "Common/ArmEmitter.h"
-namespace ArmGen { class ARMXEmitter; }
-using namespace ArmGen;
-typedef ArmGen::ARMXCodeBlock CodeBlock;
-#elif defined(_M_IX86) || defined(_M_X64)
-#include "Common/x64Emitter.h"
-namespace Gen { class XEmitter; }
-using namespace Gen;
-typedef Gen::XCodeBlock CodeBlock;
-#elif defined(PPC)
-#include "Common/ppcEmitter.h"
-namespace PpcGen { class PPCXEmitter; }
-using namespace PpcGen;
-typedef PpcGen::PPCXCodeBlock CodeBlock;
-#else
-#error "Unsupported arch!"
-#endif
-
-#if defined(ARM)
+#if defined(ARM) || defined(ARM64)
 const int MAX_JIT_BLOCK_EXITS = 2;
 #else
 const int MAX_JIT_BLOCK_EXITS = 8;
 #endif
+
+struct BlockCacheStats {
+	int numBlocks;
+	float avgBloat;  // In code bytes, not instructions!
+	float minBloat;
+	u32 minBloatBlock;
+	float maxBloat;
+	u32 maxBloatBlock;
+	std::map<float, u32> bloatMap;
+};
+
+enum class DestroyType {
+	DESTROY,
+	INVALIDATE,
+	// Skips jit unlink, since it'll be poisoned anyway.
+	CLEAR,
+};
 
 // Define this in order to get VTune profile support for the Jit generated code.
 // Add the VTune include/lib directories to the project directories to get this to build.
@@ -59,7 +59,7 @@ const int MAX_JIT_BLOCK_EXITS = 8;
 struct JitBlock {
 	bool ContainsAddress(u32 em_address);
 
-	const u8 *checkedEntry;
+	u8 *checkedEntry;  // not const, may need to write through this to unlink
 	const u8 *normalEntry;
 
 	u8 *exitPtrs[MAX_JIT_BLOCK_EXITS];      // to be able to rewrite the exit jump
@@ -93,14 +93,30 @@ struct JitBlock {
 
 typedef void (*CompiledCode)();
 
-class JitBlockCache {
+struct JitBlockDebugInfo {
+	uint32_t originalAddress;
+	std::vector<std::string> origDisasm;
+	std::vector<std::string> irDisasm;  // if any
+	std::vector<std::string> targetDisasm;
+};
+
+class JitBlockCacheDebugInterface {
 public:
-	JitBlockCache(MIPSState *mips_, CodeBlock *codeBlock);
+	virtual int GetNumBlocks() const = 0;
+	virtual int GetBlockNumberFromStartAddress(u32 em_address, bool realBlocksOnly = true) const = 0;
+	virtual JitBlockDebugInfo GetBlockDebugInfo(int blockNum) const = 0;
+	virtual void ComputeStats(BlockCacheStats &bcStats) const = 0;
+
+	virtual ~JitBlockCacheDebugInterface() {}
+};
+
+class JitBlockCache : public JitBlockCacheDebugInterface {
+public:
+	JitBlockCache(MIPSState *mips_, CodeBlockCommon *codeBlock);
 	~JitBlockCache();
 
 	int AllocateBlock(u32 em_address);
-	// When a proxy block is invalidated, the block located at the rootAddress
-	// is invalidated too.
+	// When a proxy block is invalidated, the block located at the rootAddress is invalidated too.
 	void ProxyBlock(u32 rootAddress, u32 startAddress, u32 size, const u8 *codePtr);
 	void FinalizeBlock(int block_num, bool block_link);
 
@@ -110,12 +126,14 @@ public:
 	void Reset();
 
 	bool IsFull() const;
+	void ComputeStats(BlockCacheStats &bcStats) const override;
 
 	// Code Cache
 	JitBlock *GetBlock(int block_num);
+	const JitBlock *GetBlock(int block_num) const;
 
 	// Fast way to get a block. Only works on the first source-cpu instruction of a block.
-	int GetBlockNumberFromStartAddress(u32 em_address, bool realBlocksOnly = true);
+	int GetBlockNumberFromStartAddress(u32 em_address, bool realBlocksOnly = true) const override;
 
 	// slower, but can get numbers from within blocks, not just the first instruction.
 	// WARNING! WILL NOT WORK WITH JIT INLINING ENABLED (not yet a feature but will be soon)
@@ -132,29 +150,40 @@ public:
 
 	// DOES NOT WORK CORRECTLY WITH JIT INLINING
 	void InvalidateICache(u32 address, const u32 length);
-	void DestroyBlock(int block_num, bool invalidate);
+	void InvalidateChangedBlocks();
+	void DestroyBlock(int block_num, DestroyType type);
 
 	// No jit operations may be run between these calls.
 	// Meant to be used to make memory safe for savestates, memcpy, etc.
 	std::vector<u32> SaveAndClearEmuHackOps();
 	void RestoreSavedEmuHackOps(std::vector<u32> saved);
 
-	int GetNumBlocks() const { return num_blocks_; }
+	int GetNumBlocks() const override { return num_blocks_; }
+
+	static int GetBlockExitSize();
+
+	JitBlockDebugInfo GetBlockDebugInfo(int blockNum) const override;
+
+	enum {
+		MAX_BLOCK_INSTRUCTIONS = 0x4000,
+	};
 
 private:
 	void LinkBlockExits(int i);
 	void LinkBlock(int i);
 	void UnlinkBlock(int i);
 
+	void AddBlockMap(int block_num);
+	void RemoveBlockMap(int block_num);
+
 	MIPSOpcode GetEmuHackOpForBlock(int block_num) const;
 
-	MIPSState *mips_;
-	CodeBlock *codeBlock_;
+	CodeBlockCommon *codeBlock_;
 	JitBlock *blocks_;
-	std::vector<int> proxyBlockIndices_;
+	std::unordered_multimap<u32, int> proxyBlockMap_;
 
 	int num_blocks_;
-	std::multimap<u32, int> links_to_;
+	std::unordered_multimap<u32, int> links_to_;
 	std::map<std::pair<u32,u32>, u32> block_map_; // (end_addr, start_addr) -> number
 
 	enum {

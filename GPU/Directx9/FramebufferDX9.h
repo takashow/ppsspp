@@ -21,104 +21,83 @@
 #include <set>
 #include <map>
 
-#include "d3d9.h"
+#include <d3d9.h>
 
-#include "GPU/Directx9/helper/fbo.h"
 // Keeps track of allocated FBOs.
 // Also provides facilities for drawing and later converting raw
 // pixel data.
 
-
-#include "Globals.h"
 #include "GPU/GPUCommon.h"
 #include "GPU/Common/FramebufferCommon.h"
+#include "Core/Config.h"
+#include "ext/native/thin3d/thin3d.h"
 
 namespace DX9 {
 
 class TextureCacheDX9;
-class TransformDrawEngineDX9;
+class DrawEngineDX9;
 class ShaderManagerDX9;
-
-void CenterRect(float *x, float *y, float *w, float *h,
-								float origW, float origH, float frameW, float frameH);
-
 
 class FramebufferManagerDX9 : public FramebufferManagerCommon {
 public:
-	FramebufferManagerDX9();
+	FramebufferManagerDX9(Draw::DrawContext *draw);
 	~FramebufferManagerDX9();
 
-	void SetTextureCache(TextureCacheDX9 *tc) {
-		textureCache_ = tc;
-	}
-	void SetShaderManager(ShaderManagerDX9 *sm) {
-		shaderManager_ = sm;
-	}
-	void SetTransformDrawEngine(TransformDrawEngineDX9 *td) {
-		transformDraw_ = td;
-	}
-
-	virtual void MakePixelTexture(const u8 *srcPixels, GEBufferFormat srcPixelFormat, int srcStride, int width, int height) override;
-	virtual void DrawPixels(VirtualFramebuffer *vfb, int dstX, int dstY, const u8 *srcPixels, GEBufferFormat srcPixelFormat, int srcStride, int width, int height) override;
-	virtual void DrawFramebuffer(const u8 *srcPixels, GEBufferFormat srcPixelFormat, int srcStride, bool applyPostShader) override;
-	
-	void DrawActiveTexture(LPDIRECT3DTEXTURE9 texture, float x, float y, float w, float h, float destW, float destH, bool flip = false, float u0 = 0.0f, float v0 = 0.0f, float u1 = 1.0f, float v1 = 1.0f);
+	void SetTextureCache(TextureCacheDX9 *tc);
+	void SetShaderManager(ShaderManagerDX9 *sm);
+	void SetDrawEngine(DrawEngineDX9 *td);
+	void DrawActiveTexture(float x, float y, float w, float h, float destW, float destH, float u0, float v0, float u1, float v1, int uvRotation, int flags) override;
 
 	void DestroyAllFBOs();
 
 	void EndFrame();
-	void Resized();
+	void Resized() override;
 	void DeviceLost();
-	void CopyDisplayToOutput();
+	void ReformatFramebufferFrom(VirtualFramebuffer *vfb, GEBufferFormat old) override;
 
-	void BlitFramebufferDepth(VirtualFramebuffer *src, VirtualFramebuffer *dst);
+	void BlitFramebufferDepth(VirtualFramebuffer *src, VirtualFramebuffer *dst) override;
 
-	void BindFramebufferColor(int stage, VirtualFramebuffer *framebuffer, bool skipCopy);
-
-	virtual void ReadFramebufferToMemory(VirtualFramebuffer *vfb, bool sync, int x, int y, int w, int h) override;
-
-	std::vector<FramebufferInfo> GetFramebufferList();
+	void BindFramebufferAsColorTexture(int stage, VirtualFramebuffer *framebuffer, int flags);
 
 	virtual bool NotifyStencilUpload(u32 addr, int size, bool skipZero = false) override;
 
-	void DestroyFramebuf(VirtualFramebuffer *vfb);
-	void ResizeFramebufFBO(VirtualFramebuffer *vfb, u16 w, u16 h, bool force = false);
+	bool GetFramebuffer(u32 fb_address, int fb_stride, GEBufferFormat format, GPUDebugBuffer &buffer, int maxRes);
+	bool GetDepthbuffer(u32 fb_address, int fb_stride, u32 z_address, int z_stride, GPUDebugBuffer &buffer) override;
+	bool GetStencilbuffer(u32 fb_address, int fb_stride, GPUDebugBuffer &buffer) override;
+	bool GetOutputFramebuffer(GPUDebugBuffer &buffer) override;
 
-	bool GetCurrentFramebuffer(GPUDebugBuffer &buffer);
-	bool GetCurrentDepthbuffer(GPUDebugBuffer &buffer);
-	bool GetCurrentStencilbuffer(GPUDebugBuffer &buffer);
-
-	virtual void RebindFramebuffer() override;
-
-	FBO *GetTempFBO(u16 w, u16 h, FBOColorDepth depth = FBO_8888);
-	LPDIRECT3DSURFACE9 GetOffscreenSurface(LPDIRECT3DSURFACE9 similarSurface);
+	LPDIRECT3DSURFACE9 GetOffscreenSurface(LPDIRECT3DSURFACE9 similarSurface, VirtualFramebuffer *vfb);
+	LPDIRECT3DSURFACE9 GetOffscreenSurface(D3DFORMAT fmt, u32 w, u32 h);
 
 protected:
-	virtual void DisableState() override;
-	virtual void ClearBuffer() override;
-	virtual void ClearDepthBuffer() override;
-	virtual void FlushBeforeCopy() override;
-	virtual void DecimateFBOs() override;
+	void Bind2DShader() override;
+	void BindPostShader(const PostShaderUniforms &uniforms) override;
+	void SetViewport2D(int x, int y, int w, int h) override;
+	void DecimateFBOs() override;
 
 	// Used by ReadFramebufferToMemory and later framebuffer block copies
-	virtual void BlitFramebuffer(VirtualFramebuffer *dst, int dstX, int dstY, VirtualFramebuffer *src, int srcX, int srcY, int w, int h, int bpp, bool flip = false) override;
+	void BlitFramebuffer(VirtualFramebuffer *dst, int dstX, int dstY, VirtualFramebuffer *src, int srcX, int srcY, int w, int h, int bpp) override;
 
-	virtual void NotifyRenderFramebufferCreated(VirtualFramebuffer *vfb) override;
-	virtual void NotifyRenderFramebufferSwitched(VirtualFramebuffer *prevVfb, VirtualFramebuffer *vfb) override;
-	virtual void NotifyRenderFramebufferUpdated(VirtualFramebuffer *vfb, bool vfbFormatChanged) override;
+	bool CreateDownloadTempBuffer(VirtualFramebuffer *nvfb) override;
+	void UpdateDownloadTempBuffer(VirtualFramebuffer *nvfb) override;
 
 private:
-	void CompileDraw2DProgram();
-	void DestroyDraw2DProgram();
+	void MakePixelTexture(const u8 *srcPixels, GEBufferFormat srcPixelFormat, int srcStride, int width, int height, float &u1, float &v1) override;
+	void PackFramebufferSync_(VirtualFramebuffer *vfb, int x, int y, int w, int h) override;
+	void PackDepthbuffer(VirtualFramebuffer *vfb, int x, int y, int w, int h);
+	bool GetRenderTargetFramebuffer(LPDIRECT3DSURFACE9 renderTarget, LPDIRECT3DSURFACE9 offscreen, int w, int h, GPUDebugBuffer &buffer);
 
-	void SetNumExtraFBOs(int num);
+	LPDIRECT3DDEVICE9 device_;
+	LPDIRECT3DDEVICE9 deviceEx_;
 
-	void PackFramebufferDirectx9_(VirtualFramebuffer *vfb, int x, int y, int w, int h);
-	
 	// Used by DrawPixels
 	LPDIRECT3DTEXTURE9 drawPixelsTex_;
 	int drawPixelsTexW_;
 	int drawPixelsTexH_;
+
+	LPDIRECT3DVERTEXSHADER9 pFramebufferVertexShader;
+	LPDIRECT3DPIXELSHADER9 pFramebufferPixelShader;
+	LPDIRECT3DVERTEXDECLARATION9 pFramebufferVertexDecl;
 
 	u8 *convBuf;
 
@@ -127,20 +106,12 @@ private:
 	LPDIRECT3DVERTEXSHADER9 stencilUploadVS_;
 	bool stencilUploadFailed_;
 
-	TextureCacheDX9 *textureCache_;
-	ShaderManagerDX9 *shaderManager_;
-	TransformDrawEngineDX9 *transformDraw_;
-	bool usePostShader_;
-	bool postShaderAtOutputResolution_;
+	TextureCacheDX9 *textureCacheDX9_;
+	ShaderManagerDX9 *shaderManagerDX9_;
+	DrawEngineDX9 *drawEngineD3D9_;
 	
-	// Used by post-processing shader
-	std::vector<FBO *> extraFBOs_;
-
-	bool resized_;
-	bool gameUsesSequentialCopies_;
-
 	struct TempFBO {
-		FBO *fbo;
+		Draw::Framebuffer *fbo;
 		int last_frame_used;
 	};
 	struct OffscreenSurface {
@@ -148,7 +119,6 @@ private:
 		int last_frame_used;
 	};
 
-	std::vector<VirtualFramebuffer *> bvfbs_; // blitting FBOs
 	std::map<u64, TempFBO> tempFBOs_;
 	std::map<u64, OffscreenSurface> offscreenSurfaces_;
 

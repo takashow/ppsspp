@@ -15,61 +15,55 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
-#include <deque>
-#include "Common/FileUtil.h"
+#include <functional>
 
-#include "base/functional.h"
 #include "ui/view.h"
 #include "ui/ui_screen.h"
 #include "ui/ui_context.h"
-#include "../Core/CwCheat.h"
 #include "UI/MiscScreens.h"
-#include "UI/GameSettingsScreen.h"
 
-using namespace UI;
 extern std::string activeCheatFile;
 extern std::string gameTitle;
 
 class CwCheatScreen : public UIDialogScreenWithBackground {
 public:
+	CwCheatScreen(std::string gamePath);
 	CwCheatScreen() {}
 	void CreateCodeList();
 	void processFileOn(std::string activatedCheat);
 	void processFileOff(std::string deactivatedCheat);
 	const char * name;
 	std::string activatedCheat, deactivatedCheat;
-	UI::EventReturn OnBack(UI::EventParams &params);
 	UI::EventReturn OnAddCheat(UI::EventParams &params);
 	UI::EventReturn OnImportCheat(UI::EventParams &params);
 	UI::EventReturn OnEditCheatFile(UI::EventParams &params);
 	UI::EventReturn OnEnableAll(UI::EventParams &params);
 
-	virtual void onFinish(DialogResult result);
+	void onFinish(DialogResult result) override;
 protected:
-	virtual void CreateViews();
+	void CreateViews() override;
 
 private:
 	UI::EventReturn OnCheckBox(UI::EventParams &params);
 	std::vector<std::string> formattedList_;
-	bool anythingChanged_;
 };
 
 // TODO: Instead just hook the OnClick event on a regular checkbox.
-class CheatCheckBox : public ClickableItem, public CwCheatScreen {
+class CheatCheckBox : public UI::ClickableItem, public CwCheatScreen {
 public:
-	CheatCheckBox(bool *toggle, const std::string &text, const std::string &smallText = "", LayoutParams *layoutParams = 0)
-		: ClickableItem(layoutParams), toggle_(toggle), text_(text) {
+	CheatCheckBox(bool *toggle, const std::string &text, const std::string &smallText = "", UI::LayoutParams *layoutParams = 0)
+		: UI::ClickableItem(layoutParams), toggle_(toggle), text_(text) {
 			OnClick.Handle(this, &CheatCheckBox::OnClicked);
 	}
 
 	virtual void Draw(UIContext &dc);
 
-	EventReturn OnClicked(EventParams &e) {
+	UI::EventReturn OnClicked(UI::EventParams &e) {
+		bool temp = false;
 		if (toggle_) {
 			*toggle_ = !(*toggle_);
+			temp = *toggle_;
 		}
-		bool temp;
-		temp = *toggle_;
 		if (temp) {
 			activatedCheat = text_;
 			processFileOn(activatedCheat);
@@ -77,7 +71,7 @@ public:
 			deactivatedCheat = text_;
 			processFileOff(deactivatedCheat);
 		}
-		return EVENT_DONE;
+		return UI::EVENT_DONE;
 	}
 
 private:

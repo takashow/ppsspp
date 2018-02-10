@@ -43,11 +43,23 @@ enum PSPDirectories {
 	DIRECTORY_SAVEDATA,
 	DIRECTORY_PAUTH,
 	DIRECTORY_DUMP,
+	DIRECTORY_SAVESTATE,
+	DIRECTORY_CACHE,
+	DIRECTORY_TEXTURES,
+	DIRECTORY_APP_CACHE,  // Use the OS app cache if available
+	DIRECTORY_VIDEO,
+	DIRECTORY_AUDIO
 };
 
+class GraphicsContext;
+enum class GPUBackend;
 
+void ResetUIState();
 void UpdateUIState(GlobalUIState newState);
 GlobalUIState GetUIState();
+
+void SetGPUBackend(GPUBackend type);
+GPUBackend GetGPUBackend();
 
 bool PSP_Init(const CoreParameter &coreParam, std::string *error_string);
 bool PSP_InitStart(const CoreParameter &coreParam, std::string *error_string);
@@ -55,13 +67,20 @@ bool PSP_InitUpdate(std::string *error_string);
 bool PSP_IsIniting();
 bool PSP_IsInited();
 void PSP_Shutdown();
+
+void PSP_BeginHostFrame();
+void PSP_EndHostFrame();
 void PSP_RunLoopUntil(u64 globalticks);
 void PSP_RunLoopFor(int cycles);
 
-void Audio_Init();
+// Call before PSP_BeginHostFrame() in order to not miss any GPU stats.
+void Core_UpdateDebugStats(bool collectStats);
 
-bool IsOnSeparateCPUThread();
+void Audio_Init();
+void Audio_Shutdown();
 bool IsAudioInitialised();
+
+void UpdateLoadedFile(FileLoader *fileLoader);
 
 std::string GetSysDirectory(PSPDirectories directoryType);
 #ifdef _WIN32
@@ -69,8 +88,7 @@ void InitSysDirectories();
 #endif
 
 // RUNNING must be at 0, NEXTFRAME must be at 1.
-enum CoreState
-{
+enum CoreState {
 	CORE_RUNNING = 0,
 	CORE_NEXTFRAME = 1,
 	CORE_STEPPING,
@@ -78,6 +96,8 @@ enum CoreState
 	CORE_POWERDOWN,
 	CORE_ERROR,
 };
+
+extern bool coreCollectDebugStats;
 
 extern volatile CoreState coreState;
 extern volatile bool coreStatePending;

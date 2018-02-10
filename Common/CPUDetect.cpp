@@ -15,7 +15,9 @@
 // Official SVN repository and contact information can be found at
 // http://code.google.com/p/dolphin-emu/
 
-#ifdef ANDROID
+#if defined(_M_IX86) || defined(_M_X64)
+
+#ifdef __ANDROID__
 #include <sys/stat.h>
 #include <fcntl.h>
 #endif
@@ -28,7 +30,9 @@
 #include "CPUDetect.h"
 #include "StringUtils.h"
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(__MINGW32__)
+#define WIN32_LEAN_AND_MEAN
+#include <Windows.h>
 #define _interlockedbittestandset workaround_ms_header_bug_platform_sdk6_set
 #define _interlockedbittestandreset workaround_ms_header_bug_platform_sdk6_reset
 #define _interlockedbittestandset64 workaround_ms_header_bug_platform_sdk6_set64
@@ -48,33 +52,24 @@ void do_cpuid(u32 regs[4], u32 cpuid_leaf) {
 #else
 
 #ifdef _M_SSE
-#include <xmmintrin.h>
+#include <emmintrin.h>
+
+#define _XCR_XFEATURE_ENABLED_MASK 0
+static unsigned long long _xgetbv(unsigned int index)
+{
+	unsigned int eax, edx;
+	__asm__ __volatile__("xgetbv" : "=a"(eax), "=d"(edx) : "c"(index));
+	return ((unsigned long long)edx << 32) | eax;
+}
+
+#else
+#define _XCR_XFEATURE_ENABLED_MASK 0
 #endif
 
-#if defined __FreeBSD__
-#include <sys/types.h>
-#include <machine/cpufunc.h>
+#if !defined(MIPS)
 
 void do_cpuidex(u32 regs[4], u32 cpuid_leaf, u32 ecxval) {
-	__cpuidex((int *)regs, cpuid_leaf, ecxval);
-}
-void do_cpuid(u32 regs[4], u32 cpuid_leaf) {
-	__cpuid((int *)regs, cpuid_leaf);
-}
-#elif !defined(MIPS)
-
-void do_cpuidex(u32 regs[4], u32 cpuid_leaf, u32 ecxval) {
-#ifdef ANDROID
-	// Use the /dev/cpu/%i/cpuid interface
-	int f = open("/dev/cpu/0/cpuid", O_RDONLY);
-	if (f) {
-		lseek64(f, ((uint64_t)ecxval << 32) | cpuid_leaf, SEEK_SET);
-		read(f, (void *)regs, 16);
-		close(f);
-	} else {
-		ELOG("CPUID %08x failed!", cpuid_leaf);
-	}
-#elif defined(__i386__) && defined(__PIC__)
+#if defined(__i386__) && defined(__PIC__)
 	asm (
 		"xchgl %%ebx, %1;\n\t"
 		"cpuid;\n\t"
@@ -113,14 +108,13 @@ void CPUInfo::Detect() {
 #endif
 	num_cores = 1;
 
-#ifdef _WIN32
-#ifdef _M_IX86
+#if PPSSPP_PLATFORM(UWP)
+	OS64bit = Mode64bit;  // TODO: Not always accurate!
+#elif defined(_WIN32) && defined(_M_IX86)
 	BOOL f64 = false;
 	IsWow64Process(GetCurrentProcess(), &f64);
 	OS64bit = (f64 == TRUE) ? true : false;
 #endif
-#endif
-
 	// Set obvious defaults, for extra safety
 	if (Mode64bit) {
 		bSSE = true;
@@ -157,6 +151,13 @@ void CPUInfo::Detect() {
 	logical_cpu_count = 1;
 	if (max_std_fn >= 1) {
 		do_cpuid(cpu_id, 0x00000001);
+		int family = ((cpu_id[0] >> 8) & 0xf) + ((cpu_id[0] >> 20) & 0xff);
+		int model = ((cpu_id[0] >> 4) & 0xf) + ((cpu_id[0] >> 12) & 0xf0);
+		// Detect people unfortunate enough to be running PPSSPP on an Atom
+		if (family == 6 && (model == 0x1C || model == 0x26 || model == 0x27 || model == 0x35 || model == 0x36 ||
+		                    model == 0x37 || model == 0x4A || model == 0x4D || model == 0x5A || model == 0x5D))
+			bAtom = true;
+
 		logical_cpu_count = (cpu_id[1] >> 16) & 0xFF;
 		ht = (cpu_id[3] >> 28) & 1;
 
@@ -172,6 +173,39 @@ void CPUInfo::Detect() {
 				bFMA = true;
 		}
 		if ((cpu_id[2] >> 25) & 1) bAES = true;
+
+		if ((cpu_id[3] >> 24) & 1)
+		{
+			// We can use FXSAVE.
+			bFXSR = true;
+		}
+
+		// AVX support requires 3 separate checks:
+		//  - Is the AVX bit set in CPUID? (>>28)
+		//  - Is the XSAVE bit set in CPUID? ( >>26)
+		//  - Is the OSXSAVE bit set in CPUID? ( >>27)
+		//  - XGETBV result has the XCR bit set.
+		if (((cpu_id[2] >> 28) & 1) && ((cpu_id[2] >> 27) & 1) && ((cpu_id[2] >> 26) & 1))
+		{
+			if ((_xgetbv(_XCR_XFEATURE_ENABLED_MASK) & 0x6) == 0x6)
+			{
+				bAVX = true;
+				if ((cpu_id[2] >> 12) & 1)
+					bFMA = true;
+			}
+		}
+
+		if (max_std_fn >= 7)
+		{
+			do_cpuid(cpu_id, 0x00000007);
+			// careful; we can't enable AVX2 unless the XSAVE/XGETBV checks above passed
+			if ((cpu_id[1] >> 5) & 1)
+				bAVX2 = bAVX;
+			if ((cpu_id[1] >> 3) & 1)
+				bBMI1 = true;
+			if ((cpu_id[1] >> 8) & 1)
+				bBMI2 = true;
+		}
 	}
 	if (max_ex_fn >= 0x80000004) {
 		// Extract brand string
@@ -233,10 +267,10 @@ std::string CPUInfo::Summarize()
 {
 	std::string sum;
 	if (num_cores == 1)
-		sum = StringFromFormat("%s, %i core", cpu_string, num_cores);
+		sum = StringFromFormat("%s, %d core", cpu_string, num_cores);
 	else
 	{
-		sum = StringFromFormat("%s, %i cores", cpu_string, num_cores);
+		sum = StringFromFormat("%s, %d cores", cpu_string, num_cores);
 		if (HTT) sum += StringFromFormat(" (%i logical threads per physical core)", logical_cpu_count);
 	}
 	if (bSSE) sum += ", SSE";
@@ -247,8 +281,10 @@ std::string CPUInfo::Summarize()
 	if (bSSE4_2) sum += ", SSE4.2";
 	if (HTT) sum += ", HTT";
 	if (bAVX) sum += ", AVX";
-	if (bAVX) sum += ", FMA";
+	if (bFMA) sum += ", FMA";
 	if (bAES) sum += ", AES";
 	if (bLongMode) sum += ", 64-bit support";
 	return sum;
 }
+
+#endif // defined(_M_IX86) || defined(_M_X64)

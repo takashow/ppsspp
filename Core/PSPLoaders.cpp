@@ -15,23 +15,27 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
-#ifdef __SYMBIAN32__
-#include <sys/param.h>
-#endif
-
+#include <thread>
 #include "file/file_util.h"
+#include "util/text/utf8.h"
 
+#include "Common/FileUtil.h"
 #include "Common/StringUtils.h"
+#ifdef _WIN32
+#include "Common/CommonWindows.h"
+#endif
 
 #include "Core/ELF/ElfReader.h"
 #include "Core/ELF/ParamSFO.h"
 
-#include "FileSystems/BlockDevices.h"
-#include "FileSystems/DirectoryFileSystem.h"
-#include "FileSystems/ISOFileSystem.h"
-#include "FileSystems/MetaFileSystem.h"
-#include "FileSystems/VirtualDiscFileSystem.h"
+#include "Core/FileSystems/BlockDevices.h"
+#include "Core/FileSystems/BlobFileSystem.h"
+#include "Core/FileSystems/DirectoryFileSystem.h"
+#include "Core/FileSystems/ISOFileSystem.h"
+#include "Core/FileSystems/MetaFileSystem.h"
+#include "Core/FileSystems/VirtualDiscFileSystem.h"
 
+#include "Core/Loaders.h"
 #include "Core/MemMap.h"
 #include "Core/HDRemaster.h"
 
@@ -50,70 +54,105 @@
 #include "Core/HLE/sceKernelModule.h"
 #include "Core/HLE/sceKernelMemory.h"
 
+static void UseLargeMem(int memsize) {
+	if (memsize != 1) {
+		// Nothing requested.
+		return;
+	}
+
+	if (Memory::g_PSPModel != PSP_MODEL_FAT) {
+		INFO_LOG(LOADER, "Game requested full PSP-2000 memory access");
+		Memory::g_MemorySize = Memory::RAM_DOUBLE_SIZE;
+	} else {
+		WARN_LOG(LOADER, "Game requested full PSP-2000 memory access, ignoring in PSP-1000 mode");
+	}
+}
+
 // We gather the game info before actually loading/booting the ISO
 // to determine if the emulator should enable extra memory and
 // double-sized texture coordinates.
-void InitMemoryForGameISO(std::string fileToStart) {
-	IFileSystem* umd2;
-
-	// check if it's a disc directory
-	FileInfo info;
-	if (!getFileInfo(fileToStart.c_str(), &info)) return;
-
-	bool actualIso = false;
-	if (info.isDirectory)
-	{
-		umd2 = new VirtualDiscFileSystem(&pspFileSystem, fileToStart);
+void InitMemoryForGameISO(FileLoader *fileLoader) {
+	if (!fileLoader->Exists()) {
+		return;
 	}
-	else 
-	{
-		auto bd = constructBlockDevice(fileToStart.c_str());
+
+	IFileSystem *fileSystem = nullptr;
+	IFileSystem *blockSystem = nullptr;
+	bool actualIso = false;
+	if (fileLoader->IsDirectory()) {
+		fileSystem = new VirtualDiscFileSystem(&pspFileSystem, fileLoader->Path());
+		blockSystem = fileSystem;
+	} else {
+		auto bd = constructBlockDevice(fileLoader);
 		// Can't init anything without a block device...
 		if (!bd)
 			return;
-		umd2 = new ISOFileSystem(&pspFileSystem, bd);
-		actualIso = true;
+
+		ISOFileSystem *iso = new ISOFileSystem(&pspFileSystem, bd);
+		fileSystem = iso;
+		blockSystem = new ISOBlockSystem(iso);
 	}
 
-	// Parse PARAM.SFO
-
-	//pspFileSystem.Mount("host0:",umd2);
-
-	IFileSystem *entireIso = 0;
-	if (actualIso) {
-		entireIso = new ISOBlockSystem(static_cast<ISOFileSystem *>(umd2));
-	} else {
-		entireIso = umd2;
-	}
-
-	pspFileSystem.Mount("umd0:", entireIso);
-	pspFileSystem.Mount("umd1:", entireIso);
-	pspFileSystem.Mount("disc0:", umd2);
-	pspFileSystem.Mount("umd:", entireIso);
+	pspFileSystem.Mount("umd0:", blockSystem);
+	pspFileSystem.Mount("umd1:", blockSystem);
+	pspFileSystem.Mount("disc0:", fileSystem);
+	pspFileSystem.Mount("umd:", blockSystem);
+	// TODO: Should we do this?
+	//pspFileSystem.Mount("host0:", fileSystem);
 
 	std::string gameID;
+	std::string umdData;
 
 	std::string sfoPath("disc0:/PSP_GAME/PARAM.SFO");
 	PSPFileInfo fileInfo = pspFileSystem.GetFileInfo(sfoPath.c_str());
 
-	if (fileInfo.exists)
-	{
+	if (fileInfo.exists) {
 		std::vector<u8> paramsfo;
 		pspFileSystem.ReadEntireFile(sfoPath, paramsfo);
-		if (g_paramSFO.ReadSFO(paramsfo))
-		{
+		if (g_paramSFO.ReadSFO(paramsfo)) {
+			UseLargeMem(g_paramSFO.GetValueInt("MEMSIZE"));
 			gameID = g_paramSFO.GetValueString("DISC_ID");
+		}
 
-			for (size_t i = 0; i < ARRAY_SIZE(g_HDRemasters); i++) {
-				if(g_HDRemasters[i].gameID == gameID) {
-					g_RemasterMode = true;
-					Memory::g_MemorySize = g_HDRemasters[i].MemorySize;
-					if(g_HDRemasters[i].DoubleTextureCoordinates)
-						g_DoubleTextureCoordinates = true;
-					break;
-				}
+		std::vector<u8> umdDataBin;
+		if (pspFileSystem.ReadEntireFile("disc0:/UMD_DATA.BIN", umdDataBin) >= 0) {
+			umdData = std::string((const char *)&umdDataBin[0], umdDataBin.size());
+		}
+	}
+
+	for (size_t i = 0; i < g_HDRemastersCount; i++) {
+		const auto &entry = g_HDRemasters[i];
+		if (entry.gameID != gameID) {
+			continue;
+		}
+		if (entry.umdDataValue && umdData.find(entry.umdDataValue) == umdData.npos) {
+			continue;
+		}
+
+		g_RemasterMode = true;
+		Memory::g_MemorySize = entry.memorySize;
+		g_DoubleTextureCoordinates = entry.doubleTextureCoordinates;
+		break;
+	}
+	if (g_RemasterMode) {
+		INFO_LOG(LOADER, "HDRemaster found, using increased memory");
+	}
+}
+
+void InitMemoryForGamePBP(FileLoader *fileLoader) {
+	if (!fileLoader->Exists()) {
+		return;
+	}
+
+	PBPReader pbp(fileLoader);
+	if (pbp.IsValid() && !pbp.IsELF()) {
+		std::vector<u8> sfoData;
+		if (pbp.GetSubFile(PBP_PARAM_SFO, &sfoData)) {
+			ParamSFOData paramSFO;
+			if (paramSFO.ReadSFO(sfoData)) {
+				// This is the parameter CFW uses to determine homebrew wants the full 64MB.
+				UseLargeMem(paramSFO.GetValueInt("MEMSIZE"));
 			}
-			DEBUG_LOG(LOADER, "HDRemaster mode is %s", g_RemasterMode? "true": "false");
 		}
 	}
 }
@@ -128,7 +167,7 @@ static const char *altBootNames[] = {
 	"disc0:/PSP_GAME/SYSDIR/EBOOT.DAT",
 	"disc0:/PSP_GAME/SYSDIR/EBOOT.BI",
 	"disc0:/PSP_GAME/SYSDIR/EBOOT.LLD",
-	"disc0:/PSP_GAME/SYSDIR/OLD_EBOOT.BIN",
+	//"disc0:/PSP_GAME/SYSDIR/OLD_EBOOT.BIN", //Utawareru Mono Chinese version
 	"disc0:/PSP_GAME/SYSDIR/EBOOT.123",
 	"disc0:/PSP_GAME/SYSDIR/EBOOT_LRC_CH.BIN",
 	"disc0:/PSP_GAME/SYSDIR/BOOT0.OLD",
@@ -142,25 +181,20 @@ static const char *altBootNames[] = {
 	"disc0:/PSP_GAME/SYSDIR/ss.RAW",
 };
 
-bool Load_PSP_ISO(const char *filename, std::string *error_string)
-{
+bool Load_PSP_ISO(FileLoader *fileLoader, std::string *error_string) {
 	// Mounting stuff relocated to InitMemoryForGameISO due to HD Remaster restructuring of code.
 
 	std::string sfoPath("disc0:/PSP_GAME/PARAM.SFO");
 	PSPFileInfo fileInfo = pspFileSystem.GetFileInfo(sfoPath.c_str());
-	if (fileInfo.exists)
-	{
+	if (fileInfo.exists) {
 		std::vector<u8> paramsfo;
 		pspFileSystem.ReadEntireFile(sfoPath, paramsfo);
-		if (g_paramSFO.ReadSFO(paramsfo))
-		{
-			char title[1024];
-			sprintf(title, "%s : %s", g_paramSFO.GetValueString("DISC_ID").c_str(), g_paramSFO.GetValueString("TITLE").c_str());
-			INFO_LOG(LOADER, "%s", title);
-			host->SetWindowTitle(title);
+		if (g_paramSFO.ReadSFO(paramsfo)) {
+			std::string title = StringFromFormat("%s : %s", g_paramSFO.GetValueString("DISC_ID").c_str(), g_paramSFO.GetValueString("TITLE").c_str());
+			INFO_LOG(LOADER, "%s", title.c_str());
+			host->SetWindowTitle(title.c_str());
 		}
 	}
-
 
 	std::string bootpath("disc0:/PSP_GAME/SYSDIR/EBOOT.BIN");
 
@@ -191,36 +225,67 @@ bool Load_PSP_ISO(const char *filename, std::string *error_string)
 		}
 		pspFileSystem.CloseFile(fd);
 	}
-	if (!hasEncrypted)
-	{
+	if (!hasEncrypted) {
 		// try unencrypted BOOT.BIN
 		bootpath = "disc0:/PSP_GAME/SYSDIR/BOOT.BIN";
 	}
 
+	// Fail early with a clearer message for some types of ISOs.
+	if (!pspFileSystem.GetFileInfo(bootpath).exists) {
+		// Can't tell for sure if it's PS1 or PS2, but doesn't much matter.
+		if (pspFileSystem.GetFileInfo("disc0:/SYSTEM.CNF;1").exists || pspFileSystem.GetFileInfo("disc0:/PSX.EXE;1").exists) {
+			*error_string = "PPSSPP plays PSP games, not Playstation 1 or 2 games.";
+		} else if (pspFileSystem.GetFileInfo("disc0:/UMD_VIDEO/PLAYLIST.UMD").exists) {
+			*error_string = "PPSSPP doesn't support UMD Video.";
+		} else if (pspFileSystem.GetFileInfo("disc0:/UMD_AUDIO/PLAYLIST.UMD").exists) {
+			*error_string = "PPSSPP doesn't support UMD Music.";
+		} else if (pspFileSystem.GetDirListing("disc0:/").empty()) {
+			*error_string = "Not a valid disc image.";
+		} else {
+			*error_string = "A PSP game couldn't be found on the disc.";
+		}
+		return false;
+	}
+
+	//in case we didn't go through EmuScreen::boot
+	g_Config.loadGameConfig(id);
+	host->SendUIMessage("config_loaded", "");
 	INFO_LOG(LOADER,"Loading %s...", bootpath.c_str());
-	return __KernelLoadExec(bootpath.c_str(), 0, error_string);
+
+	std::thread th([bootpath] {
+		// TODO: We can't use the initial error_string pointer.
+		bool success = __KernelLoadExec(bootpath.c_str(), 0, &PSP_CoreParameter().errorString);
+		if (success && coreState == CORE_POWERUP) {
+			coreState = PSP_CoreParameter().startPaused ? CORE_STEPPING : CORE_RUNNING;
+		} else {
+			coreState = CORE_ERROR;
+			// TODO: This is a crummy way to communicate the error...
+			PSP_CoreParameter().fileToStart = "";
+		}
+	});
+	th.detach();
+	return true;
 }
 
-static std::string NormalizePath(const std::string &path)
-{
+static std::string NormalizePath(const std::string &path) {
 #ifdef _WIN32
-	char buf[512] = {0};
-	if (GetFullPathNameA(path.c_str(), sizeof(buf) - 1, buf, NULL) == 0)
+	wchar_t buf[512] = {0};
+	std::wstring wpath = ConvertUTF8ToWString(path);
+	if (GetFullPathName(wpath.c_str(), (int)ARRAY_SIZE(buf) - 1, buf, NULL) == 0)
 		return "";
+	return ConvertWStringToUTF8(buf);
 #else
 	char buf[PATH_MAX + 1];
 	if (realpath(path.c_str(), buf) == NULL)
 		return "";
-#endif
 	return buf;
+#endif
 }
 
-bool Load_PSP_ELF_PBP(const char *filename, std::string *error_string)
-{
+bool Load_PSP_ELF_PBP(FileLoader *fileLoader, std::string *error_string) {
 	// This is really just for headless, might need tweaking later.
-	if (!PSP_CoreParameter().mountIso.empty())
-	{
-		auto bd = constructBlockDevice(PSP_CoreParameter().mountIso.c_str());
+	if (PSP_CoreParameter().mountIsoLoader != nullptr) {
+		auto bd = constructBlockDevice(PSP_CoreParameter().mountIsoLoader);
 		if (bd != NULL) {
 			ISOFileSystem *umd2 = new ISOFileSystem(&pspFileSystem, bd);
 
@@ -230,22 +295,32 @@ bool Load_PSP_ELF_PBP(const char *filename, std::string *error_string)
 		}
 	}
 
-	std::string full_path = filename;
+	std::string full_path = fileLoader->Path();
 	std::string path, file, extension;
 	SplitPath(ReplaceAll(full_path, "\\", "/"), &path, &file, &extension);
+
+	size_t pos = path.find("/PSP/GAME/");
+	std::string ms_path;
+	if (pos != std::string::npos) {
+		ms_path = "ms0:" + path.substr(pos);
+	} else {
+		// This is wrong, but it's better than not having a working directory at all.
+		// Note that umd0:/ is actually the writable containing directory, in this case.
+		ms_path = "umd0:/";
+	}
+
 #ifdef _WIN32
+	// Turn the slashes back to the Windows way.
 	path = ReplaceAll(path, "/", "\\");
 #endif
 
-	if (!PSP_CoreParameter().mountRoot.empty())
-	{
+	if (!PSP_CoreParameter().mountRoot.empty()) {
 		// We don't want to worry about .. and cwd and such.
 		const std::string rootNorm = NormalizePath(PSP_CoreParameter().mountRoot + "/");
 		const std::string pathNorm = NormalizePath(path + "/");
 
 		// If root is not a subpath of path, we can't boot the game.
-		if (!startsWith(pathNorm, rootNorm))
-		{
+		if (!startsWith(pathNorm, rootNorm)) {
 			*error_string = "Cannot boot ELF located outside mountRoot.";
 			return false;
 		}
@@ -254,11 +329,73 @@ bool Load_PSP_ELF_PBP(const char *filename, std::string *error_string)
 		file = filepath + "/" + file;
 		path = rootNorm + "/";
 		pspFileSystem.SetStartingDirectory(filepath);
+	} else {
+		pspFileSystem.SetStartingDirectory(ms_path);
 	}
 
 	DirectoryFileSystem *fs = new DirectoryFileSystem(&pspFileSystem, path);
 	pspFileSystem.Mount("umd0:", fs);
 
-	std::string finalName = "umd0:/" + file + extension;
-	return __KernelLoadExec(finalName.c_str(), 0, error_string);
+	std::string finalName = ms_path + file + extension;
+
+	std::string homebrewName = PSP_CoreParameter().fileToStart;
+	std::size_t lslash = homebrewName.find_last_of("/");
+	homebrewName = homebrewName.substr(lslash + 1);
+	std::string madeUpID = g_paramSFO.GenerateFakeID();
+
+	std::string title = StringFromFormat("%s : %s", madeUpID.c_str(), homebrewName.c_str());
+	INFO_LOG(LOADER, "%s", title.c_str());
+	host->SetWindowTitle(title.c_str());
+
+	// Temporary code
+	// TODO: Remove this after ~ 1.6
+	// It checks for old filenames for homebrew savestates(folder name) and rename them to new fakeID format
+	std::string savestateDir = GetSysDirectory(DIRECTORY_SAVESTATE);
+
+	for (int i = 0; i < 5; i += 1) {
+		std::string oldName = StringFromFormat("%s%s_%d.ppst", savestateDir.c_str(), homebrewName.c_str(), i);
+		if (File::Exists(oldName)) {
+			std::string newName = StringFromFormat("%s%s_1.00_%d.ppst", savestateDir.c_str(), madeUpID.c_str(), i);
+			File::Rename(oldName, newName);
+		}
+	}
+	for (int i = 0; i < 5; i += 1) {
+		std::string oldName = StringFromFormat("%s%s_%d.jpg", savestateDir.c_str(), homebrewName.c_str(), i);
+		if (File::Exists(oldName)) {
+			std::string newName = StringFromFormat("%s%s_1.00_%d.jpg", savestateDir.c_str(), madeUpID.c_str(), i);
+			File::Rename(oldName, newName);
+		}
+	}
+	// End of temporary code
+
+	std::thread th([finalName] {
+		bool success = __KernelLoadExec(finalName.c_str(), 0, &PSP_CoreParameter().errorString);
+		if (success && coreState == CORE_POWERUP) {
+			coreState = PSP_CoreParameter().startPaused ? CORE_STEPPING : CORE_RUNNING;
+		} else {
+			coreState = CORE_ERROR;
+			// TODO: This is a crummy way to communicate the error...
+			PSP_CoreParameter().fileToStart = "";
+		}
+	});
+	th.detach();
+	return true;
+}
+
+bool Load_PSP_GE_Dump(FileLoader *fileLoader, std::string *error_string) {
+	BlobFileSystem *umd = new BlobFileSystem(&pspFileSystem, fileLoader, "data.ppdmp");
+	pspFileSystem.Mount("disc0:", umd);
+
+	std::thread th([] {
+		bool success = __KernelLoadGEDump("disc0:/data.ppdmp", &PSP_CoreParameter().errorString);
+		if (success && coreState == CORE_POWERUP) {
+			coreState = PSP_CoreParameter().startPaused ? CORE_STEPPING : CORE_RUNNING;
+		} else {
+			coreState = CORE_ERROR;
+			// TODO: This is a crummy way to communicate the error...
+			PSP_CoreParameter().fileToStart = "";
+		}
+	});
+	th.detach();
+	return true;
 }

@@ -21,12 +21,14 @@
 #include <list>
 #include <memory>
 
-extern float mouseDeltaX;
-extern float mouseDeltaY;
+extern float g_mouseDeltaX;
+extern float g_mouseDeltaY;
+
+class GraphicsContext;
 
 class WindowsHost : public Host {
 public:
-	WindowsHost(HWND mainWindow, HWND displayWindow);
+	WindowsHost(HINSTANCE hInstance, HWND mainWindow, HWND displayWindow);
 
 	~WindowsHost() {
 		UpdateConsolePosition();
@@ -35,14 +37,14 @@ public:
 	void UpdateMemView() override;
 	void UpdateDisassembly() override;
 	void UpdateUI() override;
-	void UpdateScreen() override;
 	void SetDebugMode(bool mode) override;
 
-	bool InitGraphics(std::string *error_message) override;
-	void PollControllers(InputState &input_state) override;
+	// If returns false, will return a null context
+	bool InitGraphics(std::string *error_message, GraphicsContext **ctx) override;
+	void PollControllers() override;
 	void ShutdownGraphics() override;
 
-	void InitSound(PMixer *mixer) override;
+	void InitSound() override;
 	void UpdateSound() override;
 	void ShutdownSound() override;
 
@@ -62,16 +64,21 @@ public:
 	bool CanCreateShortcut() override;
 	bool CreateDesktopShortcut(std::string argumentPath, std::string title) override;
 
-	void GoFullscreen(bool) override;
+	void NotifyUserMessage(const std::string &message, float duration = 1.0f, u32 color = 0x00FFFFFF, const char *id = nullptr) override;
+	void SendUIMessage(const std::string &message, const std::string &value) override;
 
 	std::shared_ptr<KeyboardDevice> keyboard;
+
+	GraphicsContext *GetGraphicsContext() { return gfx_; }
 
 private:
 	void SetConsolePosition();
 	void UpdateConsolePosition();
 
+	HINSTANCE hInstance_;
 	HWND displayWindow_;
 	HWND mainWindow_;
+	GraphicsContext *gfx_;
 
 	std::list<std::shared_ptr<InputDevice>> input;
 };

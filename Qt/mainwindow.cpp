@@ -8,6 +8,7 @@
 #include <QMessageBox>
 
 #include "base/display.h"
+#include "base/NativeApp.h"
 #include "Core/MIPS/MIPSDebugInterface.h"
 #include "Core/Debugger/SymbolMap.h"
 #include "Core/SaveState.h"
@@ -15,7 +16,7 @@
 #include "GPU/GPUInterface.h"
 #include "UI/GamepadEmu.h"
 
-MainWindow::MainWindow(QWidget *parent) :
+MainWindow::MainWindow(QWidget *parent, bool fullscreen) :
 	QMainWindow(parent),
 	currentLanguage("en"),
 	nextState(CORE_POWERDOWN),
@@ -25,6 +26,13 @@ MainWindow::MainWindow(QWidget *parent) :
 	memoryTexWindow(0),
 	displaylistWindow(0)
 {
+	QDesktopWidget *desktop = QApplication::desktop();
+	int screenNum = QProcessEnvironment::systemEnvironment().value("SDL_VIDEO_FULLSCREEN_HEAD", "0").toInt();
+	
+	// Move window to top left coordinate of selected screen
+	QRect rect = desktop->screenGeometry(screenNum);
+	move(rect.topLeft());
+
 	SetGameTitle("");
 	emugl = new MainUI(this);
 
@@ -32,7 +40,10 @@ MainWindow::MainWindow(QWidget *parent) :
 	createMenus();
 	updateMenus();
 
-	SetZoom(g_Config.iInternalResolution);
+	SetWindowScale(-1);
+	
+	if(fullscreen)
+	  fullscrAct();
 
 	QObject::connect(emugl, SIGNAL(doubleClick()), this, SLOT(fullscrAct()));
 	QObject::connect(emugl, SIGNAL(newFrame()), this, SLOT(newFrame()));
@@ -61,6 +72,17 @@ void MainWindow::newFrame()
 
 		updateMenus();
 	}
+
+	std::unique_lock<std::mutex> lock(msgMutex_);
+	while (!msgQueue_.empty()) {
+		MainWindowMsg msg = msgQueue_.front();
+		msgQueue_.pop();
+		switch (msg) {
+		case MainWindowMsg::BOOT_DONE:
+			bootDone();
+			break;
+		}
+	}
 }
 
 void MainWindow::updateMenus()
@@ -73,7 +95,19 @@ void MainWindow::updateMenus()
 	}
 
 	foreach(QAction * action, screenGroup->actions()) {
-		if (g_Config.iInternalResolution == action->data().toInt()) {
+		int width = (g_Config.IsPortrait() ? 272 : 480) * action->data().toInt();
+		int height = (g_Config.IsPortrait() ? 480 : 272) * action->data().toInt();
+		if (g_Config.iWindowWidth == width && g_Config.iWindowHeight == height) {
+			action->setChecked(true);
+			break;
+		}
+	}
+
+	foreach(QAction * action, displayLayoutGroup->actions()) {
+		if (g_Config.iSmallDisplayZoomType == action->data().toInt()) {
+
+			NativeMessageReceived("gpu_resized", "");
+
 			action->setChecked(true);
 			break;
 		}
@@ -105,8 +139,7 @@ void MainWindow::updateMenus()
 	emit updateMenu();
 }
 
-/* SLOTS */
-void MainWindow::Boot()
+void MainWindow::bootDone()
 {
 	dialogDisasm = new Debugger_Disasm(currentDebugMIPS, this, this);
 	if(g_Config.bShowDebuggerOnLoad)
@@ -117,7 +150,7 @@ void MainWindow::Boot()
 
 	memoryWindow = new Debugger_Memory(currentDebugMIPS, this, this);
 	memoryTexWindow = new Debugger_MemoryTex(this);
-	displaylistWindow = new Debugger_DisplayList(currentDebugMIPS, this, this);
+	displaylistWindow = new Debugger_DisplayList(currentDebugMIPS, gpu->GetDrawContext(), this, this);
 
 	notifyMapsLoaded();
 
@@ -126,6 +159,7 @@ void MainWindow::Boot()
 	updateMenus();
 }
 
+/* SIGNALS */
 void MainWindow::openAct()
 {
 	QString filename = QFileDialog::getOpenFileName(NULL, "Load File", g_Config.currentDirectory.c_str(), "PSP ROMs (*.pbp *.elf *.iso *.cso *.prx)");
@@ -155,7 +189,7 @@ void MainWindow::closeAct()
 	SetGameTitle("");
 }
 
-void SaveStateActionFinished(bool result, void *userdata)
+void SaveStateActionFinished(bool result, const std::string &message, void *userdata)
 {
 	// TODO: Improve messaging?
 	if (!result)
@@ -170,12 +204,14 @@ void SaveStateActionFinished(bool result, void *userdata)
 
 void MainWindow::qlstateAct()
 {
-	SaveState::LoadSlot(0, SaveStateActionFinished, this);
+	std::string gamePath = PSP_CoreParameter().fileToStart;
+	SaveState::LoadSlot(gamePath, 0, SaveStateActionFinished, this);
 }
 
 void MainWindow::qsstateAct()
 {
-	SaveState::SaveSlot(0, SaveStateActionFinished, this);
+	std::string gamePath = PSP_CoreParameter().fileToStart;
+	SaveState::SaveSlot(gamePath, 0, SaveStateActionFinished, this);
 }
 
 void MainWindow::lstateAct()
@@ -261,7 +297,7 @@ void MainWindow::lmapAct()
 	if (fileNames.count() > 0)
 	{
 		QString fileName = QFileInfo(fileNames[0]).absoluteFilePath();
-		symbolMap.LoadSymbolMap(fileName.toStdString().c_str());
+		g_symbolMap->LoadSymbolMap(fileName.toStdString().c_str());
 		notifyMapsLoaded();
 	}
 }
@@ -278,13 +314,13 @@ void MainWindow::smapAct()
 	if (dialog.exec())
 	{
 		fileNames = dialog.selectedFiles();
-		symbolMap.SaveSymbolMap(fileNames[0].toStdString().c_str());
+		g_symbolMap->SaveSymbolMap(fileNames[0].toStdString().c_str());
 	}
 }
 
 void MainWindow::resetTableAct()
 {
-	symbolMap.Clear();
+	g_symbolMap->Clear();
 	notifyMapsLoaded();
 }
 
@@ -322,11 +358,13 @@ void MainWindow::memviewTexAct()
 		memoryTexWindow->show();
 }
 
-void MainWindow::stretchAct()
+void MainWindow::raiseTopMost()
 {
-	g_Config.bStretchToDisplay = !g_Config.bStretchToDisplay;
-	if (gpu)
-		gpu->Resized();
+	
+	setWindowState( (windowState() & ~Qt::WindowMinimized) | Qt::WindowActive);
+	raise();  
+	activateWindow(); 
+	
 }
 
 void MainWindow::fullscrAct()
@@ -337,7 +375,7 @@ void MainWindow::fullscrAct()
 		updateMenus();
 
 		showNormal();
-		SetZoom(g_Config.iInternalResolution);
+		SetWindowScale(-1);
 		InitPadLayout(dp_xres, dp_yres);
 		if (GetUIState() == UISTATE_INGAME && QApplication::overrideCursor())
 			QApplication::restoreOverrideCursor();
@@ -352,28 +390,34 @@ void MainWindow::fullscrAct()
 
 		showFullScreen();
 
-		if (gpu)
-			gpu->Resized();
+		NativeMessageReceived("gpu_resized", "");
 		InitPadLayout(dp_xres, dp_yres);
 		if (GetUIState() == UISTATE_INGAME && !g_Config.bShowTouchControls)
 			QApplication::setOverrideCursor(QCursor(Qt::BlankCursor));
 
 	}
+	
+	QTimer::singleShot(1000, this, SLOT(raiseTopMost()));
 }
 
 void MainWindow::websiteAct()
 {
-	QDesktopServices::openUrl(QUrl("http://www.ppsspp.org/"));
+	QDesktopServices::openUrl(QUrl("https://www.ppsspp.org/"));
 }
 
 void MainWindow::forumAct()
 {
-	QDesktopServices::openUrl(QUrl("http://forums.ppsspp.org/"));
+	QDesktopServices::openUrl(QUrl("https://forums.ppsspp.org/"));
+}
+
+void MainWindow::gitAct() 
+{
+	QDesktopServices::openUrl(QUrl("https://github.com/hrydgard/ppsspp/"));
 }
 
 void MainWindow::aboutAct()
 {
-	QMessageBox::about(this, "About", QString::fromUtf8("PPSSPP Qt " PPSSPP_GIT_VERSION "\n\n"
+	QMessageBox::about(this, "About", QString("PPSSPP Qt %1\n\n"
 	                                                    "PSP emulator and debugger\n\n"
 	                                                    "Copyright (c) by Henrik Rydg\xc3\xa5rd and the PPSSPP Project 2012-\n"
 	                                                    "Qt port maintained by xSacha\n\n"
@@ -383,27 +427,44 @@ void MainWindow::aboutAct()
 	                                                    "    zlib by Jean-loup Gailly (compression) and Mark Adler (decompression)\n"
 	                                                    "    Qt project by Digia\n\n"
 	                                                    "All trademarks are property of their respective owners.\n"
-	                                                    "The emulator is for educational and development purposes only and it may not be used to play games you do not legally own."));
+	                                                    "The emulator is for educational and development purposes only and it may not be used to play games you do not legally own.").arg(PPSSPP_GIT_VERSION));
 }
 
 /* Private functions */
-void MainWindow::SetZoom(int zoom) {
+void MainWindow::SetWindowScale(int zoom) {
 	if (isFullScreen())
 		fullscrAct();
-	if (zoom < 1) zoom = 1;
-	if (zoom > 4) zoom = 4;
-	g_Config.iInternalResolution = zoom;
 
-	emugl->setFixedSize(480 * zoom, 272 * zoom);
+	int width, height;
+	if (zoom == -1 && (g_Config.iWindowWidth <= 0 || g_Config.iWindowHeight <= 0)) {
+		// Default to zoom level 2.
+		zoom = 2;
+	}
+	if (zoom == -1) {
+		// Take the last setting.
+		width = g_Config.iWindowWidth;
+		height = g_Config.iWindowHeight;
+	} else {
+		// Update to the specified factor.  Let's clamp first.
+		if (zoom < 1)
+			zoom = 1;
+		if (zoom > 4)
+			zoom = 4;
+
+		width = (g_Config.IsPortrait() ? 272 : 480) * zoom;
+		height = (g_Config.IsPortrait() ? 480 : 272) * zoom;
+	}
+
+	g_Config.iWindowWidth = width;
+	g_Config.iWindowHeight = height;
+
+	emugl->setFixedSize(g_Config.iWindowWidth, g_Config.iWindowHeight);
 	setFixedSize(sizeHint());
-
-	if (gpu)
-		gpu->Resized();
 }
 
 void MainWindow::SetGameTitle(QString text)
 {
-	QString title = "PPSSPP " PPSSPP_GIT_VERSION;
+	QString title = QString("PPSSPP %1").arg(PPSSPP_GIT_VERSION);
 	if (text != "")
 		title += QString(" - %1").arg(text);
 
@@ -488,8 +549,6 @@ void MainWindow::createMenus()
 	MenuTree* optionsMenu = new MenuTree(this, menuBar(), QT_TR_NOOP("&Options"));
 	// - Core
 	MenuTree* coreMenu = new MenuTree(this, optionsMenu,      QT_TR_NOOP("&Core"));
-	coreMenu->add(new MenuAction(this, SLOT(dynarecAct()),        QT_TR_NOOP("&CPU Dynarec")))
-		->addEventChecked(&g_Config.bJit);
 	coreMenu->add(new MenuAction(this, SLOT(vertexDynarecAct()),  QT_TR_NOOP("&Vertex Decoder Dynarec")))
 		->addEventChecked(&g_Config.bVertexDecoderJit);
 	coreMenu->add(new MenuAction(this, SLOT(fastmemAct()),        QT_TR_NOOP("Fast &Memory (unstable)")))
@@ -503,7 +562,6 @@ void MainWindow::createMenus()
 	anisotropicGroup = new MenuActionGroup(this, anisotropicMenu, SLOT(anisotropicGroup_triggered(QAction *)),
 		QStringList() << "Off" << "2x" << "4x" << "8x" << "16x",
 		QList<int>()  << 0     << 1    << 2    << 3    << 4);
-	// TODO: Check for newer buffer render options
 	videoMenu->add(new MenuAction(this, SLOT(bufferRenderAct()),  QT_TR_NOOP("&Buffered Rendering"), Qt::Key_F5))
 		->addEventChecked(&g_Config.iRenderingMode);
 	videoMenu->add(new MenuAction(this, SLOT(linearAct()),        QT_TR_NOOP("&Linear Filtering")))
@@ -516,8 +574,10 @@ void MainWindow::createMenus()
 		QList<int>()  << 1    << 2    << 3    << 4,
 		QList<int>() << Qt::CTRL + Qt::Key_1 << Qt::CTRL + Qt::Key_2 << Qt::CTRL + Qt::Key_3 << Qt::CTRL + Qt::Key_4);
 
-	videoMenu->add(new MenuAction(this, SLOT(stretchAct()),       QT_TR_NOOP("&Stretch to Display")))
-		->addEventChecked(&g_Config.bStretchToDisplay);
+	MenuTree* displayLayoutMenu = new MenuTree(this, videoMenu, QT_TR_NOOP("&Display Layout Options"));
+	displayLayoutGroup = new MenuActionGroup(this, displayLayoutMenu, SLOT(displayLayoutGroup_triggered(QAction *)),
+		QStringList() << "Stretched" << "Partialy stretched" << "Auto Scaling" << "Manual Scaling",
+		QList<int>() << 0 << 1 << 2 << 3);
 	videoMenu->addSeparator();
 	videoMenu->add(new MenuAction(this, SLOT(transformAct()),     QT_TR_NOOP("&Hardware Transform"), Qt::Key_F6))
 		->addEventChecked(&g_Config.bHardwareTransform);
@@ -599,6 +659,7 @@ void MainWindow::createMenus()
 	MenuTree* helpMenu = new MenuTree(this, menuBar(),    QT_TR_NOOP("&Help"));
 	helpMenu->add(new MenuAction(this, SLOT(websiteAct()),    QT_TR_NOOP("Official &website"), QKeySequence::HelpContents));
 	helpMenu->add(new MenuAction(this, SLOT(forumAct()),      QT_TR_NOOP("Official &forum")));
+	helpMenu->add(new MenuAction(this, SLOT(gitAct()),        QT_TR_NOOP("&GitHub")));
 	helpMenu->add(new MenuAction(this, SLOT(aboutAct()),      QT_TR_NOOP("&About PPSSPP..."), QKeySequence::WhatsThis));
 
 	retranslate();

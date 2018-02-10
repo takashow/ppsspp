@@ -24,6 +24,7 @@
 
 #include "Common/CommonTypes.h"
 #include "Core/HW/BufferQueue.h"
+#include "Core/HW/SasReverb.h"
 
 class PointerWrap;
 
@@ -32,10 +33,12 @@ enum {
 
 	PSP_SAS_PITCH_MIN = 0x0000,
 	PSP_SAS_PITCH_BASE = 0x1000,
+	PSP_SAS_PITCH_MASK = 0xFFF,
 	PSP_SAS_PITCH_BASE_SHIFT = 12,
 	PSP_SAS_PITCH_MAX = 0x4000,
 
 	PSP_SAS_VOL_MAX = 0x1000,
+	PSP_SAS_MAX_GRAIN = 2048,   // Matches the max value of the parameter to sceSasInit
 
 	PSP_SAS_ADSR_CURVE_MODE_LINEAR_INCREASE = 0,
 	PSP_SAS_ADSR_CURVE_MODE_LINEAR_DECREASE = 1,
@@ -54,14 +57,15 @@ enum {
 
 	PSP_SAS_EFFECT_TYPE_OFF = -1,
 	PSP_SAS_EFFECT_TYPE_ROOM = 0,
-	PSP_SAS_EFFECT_TYPE_UNK1 = 1,
-	PSP_SAS_EFFECT_TYPE_UNK2 = 2,
-	PSP_SAS_EFFECT_TYPE_UNK3 = 3,
+	PSP_SAS_EFFECT_TYPE_STUDIO_SMALL= 1,
+	PSP_SAS_EFFECT_TYPE_STUDIO_MEDIUM = 2,
+	PSP_SAS_EFFECT_TYPE_STUDIO_LARGE = 3,
 	PSP_SAS_EFFECT_TYPE_HALL = 4,
 	PSP_SAS_EFFECT_TYPE_SPACE = 5,
 	PSP_SAS_EFFECT_TYPE_ECHO = 6,
 	PSP_SAS_EFFECT_TYPE_DELAY = 7,
 	PSP_SAS_EFFECT_TYPE_PIPE = 8,
+	PSP_SAS_EFFECT_TYPE_MAX = 8,
 
 	PSP_SAS_OUTPUTMODE_MIXED = 0,
 	PSP_SAS_OUTPUTMODE_RAW = 1,
@@ -91,7 +95,9 @@ enum VoiceType {
 // It compresses 28 16-bit samples into a block of 16 bytes.
 class VagDecoder {
 public:
-	VagDecoder() : data_(0), read_(0), end_(true) {}
+	VagDecoder() : data_(0), read_(0), end_(true) {
+		memset(samples, 0, sizeof(samples));
+	}
 	void Start(u32 dataPtr, u32 vagSize, bool loopEnabled);
 
 	void GetSamples(s16 *outSamples, int numSamples);
@@ -101,8 +107,10 @@ public:
 
 	void DoState(PointerWrap &p);
 
+	u32 GetReadPtr() const { return read_; }
+
 private:
-	int samples[28];
+	s16 samples[28];
 	int curSample;
 
 	u32 data_;
@@ -122,17 +130,21 @@ private:
 
 class SasAtrac3 {
 public:
-	SasAtrac3() : contextAddr(0), atracID(-1), sampleQueue(0) {}
-	~SasAtrac3() { if (sampleQueue) delete sampleQueue; }
+	SasAtrac3() : contextAddr_(0), atracID_(-1), sampleQueue_(0), end_(false) {}
+	~SasAtrac3() { if (sampleQueue_) delete sampleQueue_; }
 	int setContext(u32 context);
-	int getNextSamples(s16* outbuf, int wantedSamples);
+	void getNextSamples(s16 *outbuf, int wantedSamples);
 	int addStreamData(u32 bufPtr, u32 addbytes);
 	void DoState(PointerWrap &p);
+	bool End() const {
+		return end_;
+	}
 
 private:
-	u32 contextAddr;
-	int atracID;
-	BufferQueue *sampleQueue;
+	u32 contextAddr_;
+	int atracID_;
+	BufferQueue *sampleQueue_;
+	bool end_;
 };
 
 class ADSREnvelope {
@@ -202,6 +214,8 @@ struct SasVoice {
 			vagSize(0),
 			pcmAddr(0),
 			pcmSize(0),
+			pcmIndex(0),
+			pcmLoopPos(0),
 			sampleRate(44100),
 			sampleFrac(0),
 			pitch(PSP_SAS_PITCH_BASE),
@@ -222,7 +236,7 @@ struct SasVoice {
 	void DoState(PointerWrap &p);
 
 	void ReadSamples(s16 *output, int numSamples);
-	bool HaveSamplesEnded();
+	bool HaveSamplesEnded() const;
 
 	bool playing;
 	bool paused;  // a voice can be playing AND paused. In that case, it won't play.
@@ -238,7 +252,7 @@ struct SasVoice {
 	int pcmLoopPos;
 	int sampleRate;
 
-	int sampleFrac;
+	uint32_t sampleFrac;
 	int pitch;
 	bool loop;
 
@@ -266,6 +280,7 @@ public:
 	void ClearGrainSize();
 	void SetGrainSize(int newGrainSize);
 	int GetGrainSize() const { return grainSize; }
+	int EstimateMixUs();
 
 	int maxVoices;
 	int sampleRate;
@@ -273,7 +288,8 @@ public:
 
 	int *mixBuffer;
 	int *sendBuffer;
-	s16 *resampleBuffer;
+	s16 *sendBufferDownsampled;
+	s16 *sendBufferProcessed;
 
 	FILE *audioDump;
 
@@ -281,7 +297,11 @@ public:
 	void MixVoice(SasVoice &voice);
 
 	// Applies reverb to send buffer, according to waveformEffect.
-	void ApplyReverb();
+	void ApplyWaveformEffect();
+	void SetWaveformEffectType(int type);
+	void WriteMixedOutput(s16 *outp, const s16 *inp, int leftVol, int rightVol);
+
+	void GetDebugText(char *text, size_t bufsize);
 
 	void DoState(PointerWrap &p);
 
@@ -289,5 +309,7 @@ public:
 	WaveformEffect waveformEffect;
 
 private:
+	SasReverb reverb_;
 	int grainSize;
+	int16_t mixTemp_[PSP_SAS_MAX_GRAIN * 4 + 2 + 8];  // some extra margin for very high pitches.
 };

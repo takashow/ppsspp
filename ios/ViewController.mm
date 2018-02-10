@@ -6,8 +6,8 @@
 //
 
 #import "ViewController.h"
-#import "AudioEngine.h"
 #import <GLKit/GLKit.h>
+#include <cassert>
 
 #include "base/display.h"
 #include "base/timeutil.h"
@@ -15,39 +15,73 @@
 #include "input/input_state.h"
 #include "net/resolve.h"
 #include "ui/screen.h"
+#include "thin3d/thin3d.h"
+#include "thin3d/GLRenderManager.h"
 #include "input/keycodes.h"
+#include "gfx_es2/gpu_features.h"
 
 #include "Core/Config.h"
-#include "gfx_es2/fbo.h"
+#include "Core/System.h"
+#include "Common/GraphicsContext.h"
+
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#include <mach/machine.h>
 
 #define IS_IPAD() ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad)
+#define IS_IPHONE() ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPhone)
 
-float dp_xscale = 1.0f;
-float dp_yscale = 1.0f;
+class IOSGraphicsContext : public DummyGraphicsContext {
+public:
+	IOSGraphicsContext() {
+		CheckGLExtensions();
+		draw_ = Draw::T3DCreateGLContext();
+		renderManager_ = (GLRenderManager *)draw_->GetNativeObject(Draw::NativeObject::RENDER_MANAGER);
+		SetGPUBackend(GPUBackend::OPENGL);
+		bool success = draw_->CreatePresets();
+		assert(success);
+	}
+	~IOSGraphicsContext() {
+		delete draw_;
+	}
+	Draw::DrawContext *GetDrawContext() override {
+		return draw_;
+	}
+	void ThreadStart() override {
+		renderManager_->ThreadStart();
+	}
 
-double lastSelectPress = 0.0f;
-double lastStartPress = 0.0f;
-bool simulateAnalog = false;
+	bool ThreadFrame() override {
+		return renderManager_->ThreadFrame();
+	}
 
-extern ScreenManager *screenManager;
-InputState input_state;
+	void ThreadEnd() override {
+		renderManager_->ThreadEnd();
+	}
+private:
+	Draw::DrawContext *draw_;
+	GLRenderManager *renderManager_;
+};
 
-extern std::string ram_temp_file;
-extern bool iosCanUseJit;
+static float dp_xscale = 1.0f;
+static float dp_yscale = 1.0f;
 
-ViewController* sharedViewController;
+static double lastSelectPress = 0.0f;
+static double lastStartPress = 0.0f;
+static bool simulateAnalog = false;
+static bool threadEnabled = true;
+
+__unsafe_unretained static ViewController* sharedViewController;
+static GraphicsContext *graphicsContext;
 
 @interface ViewController ()
 {
 	std::map<uint16_t, uint16_t> iCadeToKeyMap;
 }
 
-@property (nonatomic) EAGLContext* context;
-@property (nonatomic) NSString* documentsPath;
-@property (nonatomic) NSString* bundlePath;
-@property (nonatomic) NSMutableArray* touches;
-@property (nonatomic) AudioEngine* audioEngine;
-@property (nonatomic) iCadeReaderView* iCadeView;
+@property (nonatomic, strong) EAGLContext* context;
+@property (nonatomic, strong) NSMutableArray<NSDictionary *>* touches;
+//@property (nonatomic) iCadeReaderView* iCadeView;
 #if __IPHONE_OS_VERSION_MAX_ALLOWED > __IPHONE_6_1
 @property (nonatomic) GCController *gameController __attribute__((weak_import));
 #endif
@@ -56,36 +90,11 @@ ViewController* sharedViewController;
 
 @implementation ViewController
 
-- (id)init
-{
+-(id) init {
 	self = [super init];
 	if (self) {
 		sharedViewController = self;
 		self.touches = [NSMutableArray array];
-		self.documentsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) objectAtIndex:0];
-		self.bundlePath = [[[NSBundle mainBundle] resourcePath] stringByAppendingString:@"/assets/"];
-
-		memset(&input_state, 0, sizeof(input_state));
-
-		net::Init();
-
-		ram_temp_file = [[NSTemporaryDirectory() stringByAppendingPathComponent:@"ram_tmp.file"] fileSystemRepresentation];
-		
-		iosCanUseJit = false;
-		NSArray *jailPath = [NSArray arrayWithObjects:
-							@"/Applications/Cydia.app",
-							@"/private/var/lib/apt" ,
-							@"/private/var/stash" ,
-							@"/usr/sbin/sshd" ,
-							@"/usr/bin/sshd" , nil];
-
-		for(NSString *string in jailPath)
-		{
-			if ([[NSFileManager defaultManager] fileExistsAtPath:string])
-				iosCanUseJit = true;
-		}
-        
-		NativeInit(0, NULL, [self.documentsPath UTF8String], [self.bundlePath UTF8String], NULL);
 
 		iCadeToKeyMap[iCadeJoystickUp]		= NKCODE_DPAD_UP;
 		iCadeToKeyMap[iCadeJoystickRight]	= NKCODE_DPAD_RIGHT;
@@ -102,27 +111,25 @@ ViewController* sharedViewController;
 
 #if __IPHONE_OS_VERSION_MAX_ALLOWED > __IPHONE_6_1
 		if ([GCController class]) // Checking the availability of a GameController framework
-        {
-            [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(controllerDidConnect:) name:GCControllerDidConnectNotification object:nil];
-            [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(controllerDidDisconnect:) name:GCControllerDidDisconnectNotification object:nil];
+		{
+			[[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(controllerDidConnect:) name:GCControllerDidConnectNotification object:nil];
+			[[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(controllerDidDisconnect:) name:GCControllerDidDisconnectNotification object:nil];
 		}
 #endif
 	}
 	return self;
 }
 
-- (void)viewDidLoad
-{
+- (void)viewDidLoad {
 	[super viewDidLoad];
 
 	self.view.frame = [[UIScreen mainScreen] bounds];
 	self.view.multipleTouchEnabled = YES;
 	self.context = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES3];
-    
-    if (!self.context)
-    {
-        self.context = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
-    }
+	
+	if (!self.context) {
+		self.context = [[EAGLContext alloc] initWithAPI:kEAGLRenderingAPIOpenGLES2];
+	}
 
 	GLKView* view = (GLKView *)self.view;
 	view.context = self.context;
@@ -130,52 +137,65 @@ ViewController* sharedViewController;
 	[EAGLContext setCurrentContext:self.context];
 	self.preferredFramesPerSecond = 60;
 
+	// Might be useful for a speed boot, sacrificing resolution:
+	// view.contentScaleFactor = 1.0;
+
 	float scale = [UIScreen mainScreen].scale;
+	
+	if ([[UIScreen mainScreen] respondsToSelector:@selector(nativeScale)]) {
+		scale = [UIScreen mainScreen].nativeScale;
+	}
+
 	CGSize size = [[UIApplication sharedApplication].delegate window].frame.size;
 
-	if (size.height > size.width)
-    {
+	if (size.height > size.width) {
 		float h = size.height;
 		size.height = size.width;
 		size.width = h;
 	}
 
-	g_dpi = (IS_IPAD() ? 200 : 150) * scale;
-	g_dpi_scale = 240.0f / (float)g_dpi;
+	g_dpi = (IS_IPAD() ? 200.0f : 150.0f) * scale;
+	g_dpi_scale_x = 240.0f / g_dpi;
+	g_dpi_scale_y = 240.0f / g_dpi;
+	g_dpi_scale_real_x = g_dpi_scale_x;
+	g_dpi_scale_real_y = g_dpi_scale_y;
 	pixel_xres = size.width * scale;
 	pixel_yres = size.height * scale;
-	pixel_in_dps = (float)pixel_xres / (float)dp_xres;
 
-	dp_xres = pixel_xres * g_dpi_scale;
-	dp_yres = pixel_yres * g_dpi_scale;
+	dp_xres = pixel_xres * g_dpi_scale_x;
+	dp_yres = pixel_yres * g_dpi_scale_y;
 
-	NativeInitGraphics();
+	pixel_in_dps_x = (float)pixel_xres / (float)dp_xres;
+	pixel_in_dps_y = (float)pixel_yres / (float)dp_yres;
+
+	graphicsContext = new IOSGraphicsContext();
+	
+	NativeInitGraphics(graphicsContext);
+	graphicsContext->ThreadStart();
 
 	dp_xscale = (float)dp_xres / (float)pixel_xres;
 	dp_yscale = (float)dp_yres / (float)pixel_yres;
-    
-	self.iCadeView = [[iCadeReaderView alloc] init];
+	
+	/*self.iCadeView = [[iCadeReaderView alloc] init];
 	[self.view addSubview:self.iCadeView];
 	self.iCadeView.delegate = self;
-	self.iCadeView.active = YES;
-    
+	self.iCadeView.active = YES;*/
+	
 #if __IPHONE_OS_VERSION_MAX_ALLOWED > __IPHONE_6_1
-    if ([GCController class]) {
-        if ([[GCController controllers] count] > 0) {
-            [self setupController:[[GCController controllers] firstObject]];
-        }
-    }
-#endif
-}
-
-- (void)viewDidUnload
-{
-	[super viewDidUnload];
-
-	if ([EAGLContext currentContext] == self.context) {
-		[EAGLContext setCurrentContext:nil];
+	if ([GCController class]) {
+		if ([[GCController controllers] count] > 0) {
+			[self setupController:[[GCController controllers] firstObject]];
+		}
 	}
-	self.context = nil;
+#endif
+	
+	dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+		while (threadEnabled) {
+			NativeUpdate();
+			NativeRender(graphicsContext);
+			time_update();
+		}
+	});
 }
 
 - (void)didReceiveMemoryWarning
@@ -185,16 +205,26 @@ ViewController* sharedViewController;
 
 - (void)dealloc
 {
-	[self viewDidUnload];
+	sharedViewController = nil;
+	
+	if ([EAGLContext currentContext] == self.context) {
+		[EAGLContext setCurrentContext:nil];
+	}
+	self.context = nil;
 
 #if __IPHONE_OS_VERSION_MAX_ALLOWED > __IPHONE_6_1
 	if ([GCController class]) {
-        [[NSNotificationCenter defaultCenter] removeObserver:self name:GCControllerDidConnectNotification object:nil];
-        [[NSNotificationCenter defaultCenter] removeObserver:self name:GCControllerDidDisconnectNotification object:nil];
-        self.gameController = nil;
-    }
+		[[NSNotificationCenter defaultCenter] removeObserver:self name:GCControllerDidConnectNotification object:nil];
+		[[NSNotificationCenter defaultCenter] removeObserver:self name:GCControllerDidDisconnectNotification object:nil];
+		self.gameController = nil;
+	}
 #endif
-    
+	threadEnabled = false;
+	graphicsContext->ThreadEnd();
+	NativeShutdownGraphics();
+	graphicsContext->Shutdown();
+	delete graphicsContext;
+	graphicsContext = NULL;
 	NativeShutdown();
 }
 
@@ -212,40 +242,29 @@ ViewController* sharedViewController;
 
 - (void)glkView:(GLKView *)view drawInRect:(CGRect)rect
 {
-	{
-		lock_guard guard(input_state.lock);
-		UpdateInputState(&input_state);
-		NativeUpdate(input_state);
-		EndInputState(&input_state);
-	}
-
-	NativeRender();
-	time_update();
+	graphicsContext->ThreadFrame();
 }
 
 - (void)touchX:(float)x y:(float)y code:(int)code pointerId:(int)pointerId
 {
-	lock_guard guard(input_state.lock);
-
 	float scale = [UIScreen mainScreen].scale;
+	
+	if ([[UIScreen mainScreen] respondsToSelector:@selector(nativeScale)]) {
+		scale = [UIScreen mainScreen].nativeScale;
+	}
 
 	float scaledX = (int)(x * dp_xscale) * scale;
 	float scaledY = (int)(y * dp_yscale) * scale;
 
 	TouchInput input;
-
-	input_state.pointer_x[pointerId] = scaledX;
-	input_state.pointer_y[pointerId] = scaledY;
 	input.x = scaledX;
 	input.y = scaledY;
 	switch (code) {
 		case 1 :
-			input_state.pointer_down[pointerId] = true;
 			input.flags = TOUCH_DOWN;
 			break;
 
 		case 2 :
-			input_state.pointer_down[pointerId] = false;
 			input.flags = TOUCH_UP;
 			break;
 
@@ -253,7 +272,6 @@ ViewController* sharedViewController;
 			input.flags = TOUCH_MOVE;
 			break;
 	}
-	input_state.mouse_valid = true;
 	input.id = pointerId;
 	NativeTouch(input);
 }
@@ -284,7 +302,7 @@ ViewController* sharedViewController;
 - (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event
 {
 	for(UITouch* touch in touches)
-    {
+	{
 		NSDictionary* dict = @{@"touch":touch,@"index":@([self freeTouchIndex])};
 		[self.touches addObject:dict];
 		CGPoint point = [touch locationInView:self.view];
@@ -295,7 +313,7 @@ ViewController* sharedViewController;
 - (void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event
 {
 	for(UITouch* touch in touches)
-    {
+	{
 		CGPoint point = [touch locationInView:self.view];
 		NSDictionary* dict = [self touchDictBy:touch];
 		[self touchX:point.x y:point.y code:0 pointerId:[[dict objectForKey:@"index"] intValue]];
@@ -305,12 +323,23 @@ ViewController* sharedViewController;
 - (void)touchesEnded:(NSSet *)touches withEvent:(UIEvent *)event
 {
 	for(UITouch* touch in touches)
-    {
+	{
 		CGPoint point = [touch locationInView:self.view];
 		NSDictionary* dict = [self touchDictBy:touch];
 		[self touchX:point.x y:point.y code:2 pointerId:[[dict objectForKey:@"index"] intValue]];
 		[self.touches removeObject:dict];
 	}
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
+{
+    for(UITouch* touch in touches)
+    {
+        CGPoint point = [touch locationInView:self.view];
+        NSDictionary* dict = [self touchDictBy:touch];
+        [self touchX:point.x y:point.y code:2 pointerId:[[dict objectForKey:@"index"] intValue]];
+        [self.touches removeObject:dict];
+    }
 }
 
 - (void)bindDefaultFBO
@@ -431,141 +460,143 @@ ViewController* sharedViewController;
 #if __IPHONE_OS_VERSION_MAX_ALLOWED > __IPHONE_6_1
 - (void)controllerDidConnect:(NSNotification *)note
 {
-    if (![[GCController controllers] containsObject:self.gameController]) self.gameController = nil;
-    
-    if (self.gameController != nil) return; // already have a connected controller
-    
-    [self setupController:(GCController *)note.object];
+	if (![[GCController controllers] containsObject:self.gameController]) self.gameController = nil;
+	
+	if (self.gameController != nil) return; // already have a connected controller
+	
+	[self setupController:(GCController *)note.object];
 }
 
 - (void)controllerDidDisconnect:(NSNotification *)note
 {
-    if (self.gameController == note.object) {
-        self.gameController = nil;
-        
-        if ([[GCController controllers] count] > 0) {
-            [self setupController:[[GCController controllers] firstObject]];
-        } else {
-            [[UIApplication sharedApplication] setIdleTimerDisabled:NO];
-        }
-    }
+	if (self.gameController == note.object) {
+		self.gameController = nil;
+		
+		if ([[GCController controllers] count] > 0) {
+			[self setupController:[[GCController controllers] firstObject]];
+		} else {
+			[[UIApplication sharedApplication] setIdleTimerDisabled:NO];
+		}
+	}
 }
 
 - (void)controllerButtonPressed:(BOOL)pressed keyCode:(keycode_t)keyCode
 {
-    KeyInput key;
-    key.deviceId = DEVICE_ID_PAD_0;
-    key.flags = pressed ? KEY_DOWN : KEY_UP;
-    key.keyCode = keyCode;
-    NativeKey(key);
+	KeyInput key;
+	key.deviceId = DEVICE_ID_PAD_0;
+	key.flags = pressed ? KEY_DOWN : KEY_UP;
+	key.keyCode = keyCode;
+	NativeKey(key);
 }
 
 - (void)setupController:(GCController *)controller
 {
-    self.gameController = controller;
-    
-    GCGamepad *baseProfile = self.gameController.gamepad;
-    if (baseProfile == nil) {
-        self.gameController = nil;
-        return;
-    }
-    
-    [[UIApplication sharedApplication] setIdleTimerDisabled:YES];   // prevent auto-lock
-    
-    self.gameController.controllerPausedHandler = ^(GCController *controller) {
-        KeyInput key;
-        key.flags = KEY_DOWN;
-        key.keyCode = NKCODE_ESCAPE;
-        key.deviceId = DEVICE_ID_KEYBOARD;
-        NativeKey(key);
-    };
-    
-    baseProfile.buttonA.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_2]; // Cross
-    };
-    
-    baseProfile.buttonB.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_3]; // Circle
-    };
-    
-    baseProfile.buttonX.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_4]; // Square
-    };
-    
-    baseProfile.buttonY.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_1]; // Triangle
-    };
-    
-    baseProfile.leftShoulder.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_7]; // LTrigger
-    };
-    
-    baseProfile.rightShoulder.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_8]; // RTrigger
-    };
-    
-    baseProfile.dpad.up.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:pressed keyCode:NKCODE_DPAD_UP];
-    };
-    
-    baseProfile.dpad.down.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:pressed keyCode:NKCODE_DPAD_DOWN];
-    };
-    
-    baseProfile.dpad.left.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:pressed keyCode:NKCODE_DPAD_LEFT];
-    };
-    
-    baseProfile.dpad.right.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:pressed keyCode:NKCODE_DPAD_RIGHT];
-    };
-    
-    GCExtendedGamepad *extendedProfile = self.gameController.extendedGamepad;
-    if (extendedProfile == nil)
-        return; // controller doesn't support extendedGamepad profile
-    
-    extendedProfile.leftTrigger.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_9]; // Select
-    };
-    
-    extendedProfile.rightTrigger.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_10]; // Start
-    };
-    
-    extendedProfile.leftThumbstick.xAxis.valueChangedHandler = ^(GCControllerAxisInput *axis, float value) {
-        AxisInput axisInput;
-        axisInput.deviceId = DEVICE_ID_PAD_0;
-        axisInput.flags = 0;
-        axisInput.axisId = JOYSTICK_AXIS_X;
-        axisInput.value = value;
-        NativeAxis(axisInput);
-    };
-    
-    extendedProfile.leftThumbstick.yAxis.valueChangedHandler = ^(GCControllerAxisInput *axis, float value) {
-        AxisInput axisInput;
-        axisInput.deviceId = DEVICE_ID_PAD_0;
-        axisInput.flags = 0;
-        axisInput.axisId = JOYSTICK_AXIS_Y;
-        axisInput.value = -value;
-        NativeAxis(axisInput);
-    };
-    
-    // Map right thumbstick as 4 extra buttons
-    extendedProfile.rightThumbstick.up.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:(value > 0.5) keyCode:NKCODE_BUTTON_5];
-    };
-    
-    extendedProfile.rightThumbstick.down.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:(value < -0.5) keyCode:NKCODE_BUTTON_6];
-    };
-    
-    extendedProfile.rightThumbstick.left.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:(value < -0.5) keyCode:NKCODE_BUTTON_11];
-    };
-    
-    extendedProfile.rightThumbstick.right.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
-        [self controllerButtonPressed:(value > 0.5) keyCode:NKCODE_BUTTON_12];
-    };
+	self.gameController = controller;
+	
+	GCGamepad *baseProfile = self.gameController.gamepad;
+	if (baseProfile == nil) {
+		self.gameController = nil;
+		return;
+	}
+	
+	[[UIApplication sharedApplication] setIdleTimerDisabled:YES];   // prevent auto-lock
+	
+	self.gameController.controllerPausedHandler = ^(GCController *controller) {
+		KeyInput key;
+		key.flags = KEY_DOWN;
+		key.keyCode = NKCODE_ESCAPE;
+		key.deviceId = DEVICE_ID_KEYBOARD;
+		NativeKey(key);
+	};
+	
+	baseProfile.buttonA.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
+		[self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_2]; // Cross
+	};
+	
+	baseProfile.buttonB.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
+		[self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_3]; // Circle
+	};
+	
+	baseProfile.buttonX.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
+		[self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_4]; // Square
+	};
+	
+	baseProfile.buttonY.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
+		[self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_1]; // Triangle
+	};
+	
+	baseProfile.leftShoulder.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
+		[self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_7]; // LTrigger
+	};
+	
+	baseProfile.rightShoulder.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
+		[self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_8]; // RTrigger
+	};
+	
+	baseProfile.dpad.up.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
+		[self controllerButtonPressed:pressed keyCode:NKCODE_DPAD_UP];
+	};
+	
+	baseProfile.dpad.down.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
+		[self controllerButtonPressed:pressed keyCode:NKCODE_DPAD_DOWN];
+	};
+	
+	baseProfile.dpad.left.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
+		[self controllerButtonPressed:pressed keyCode:NKCODE_DPAD_LEFT];
+	};
+	
+	baseProfile.dpad.right.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
+		[self controllerButtonPressed:pressed keyCode:NKCODE_DPAD_RIGHT];
+	};
+	
+	GCExtendedGamepad *extendedProfile = self.gameController.extendedGamepad;
+	if (extendedProfile == nil)
+		return; // controller doesn't support extendedGamepad profile
+	
+	extendedProfile.leftTrigger.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
+		[self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_9]; // Select
+	};
+	
+	extendedProfile.rightTrigger.valueChangedHandler = ^(GCControllerButtonInput *button, float value, BOOL pressed) {
+		[self controllerButtonPressed:pressed keyCode:NKCODE_BUTTON_10]; // Start
+	};
+	
+	extendedProfile.leftThumbstick.xAxis.valueChangedHandler = ^(GCControllerAxisInput *axis, float value) {
+		AxisInput axisInput;
+		axisInput.deviceId = DEVICE_ID_PAD_0;
+		axisInput.flags = 0;
+		axisInput.axisId = JOYSTICK_AXIS_X;
+		axisInput.value = value * g_Config.fXInputAnalogSensitivity;
+		NativeAxis(axisInput);
+	};
+	
+	extendedProfile.leftThumbstick.yAxis.valueChangedHandler = ^(GCControllerAxisInput *axis, float value) {
+		AxisInput axisInput;
+		axisInput.deviceId = DEVICE_ID_PAD_0;
+		axisInput.flags = 0;
+		axisInput.axisId = JOYSTICK_AXIS_Y;
+		axisInput.value = -value * g_Config.fXInputAnalogSensitivity;
+		NativeAxis(axisInput);
+	};
+	
+	// Map right thumbstick as another analog stick, particularly useful for controllers like the DualShock 3/4 when connected to an iOS device
+	extendedProfile.rightThumbstick.xAxis.valueChangedHandler = ^(GCControllerAxisInput *axis, float value) {
+		AxisInput axisInput;
+		axisInput.deviceId = DEVICE_ID_PAD_0;
+		axisInput.flags = 0;
+		axisInput.axisId = JOYSTICK_AXIS_Z;
+		axisInput.value = value * g_Config.fXInputAnalogSensitivity;
+		NativeAxis(axisInput);
+	};
+	
+	extendedProfile.rightThumbstick.yAxis.valueChangedHandler = ^(GCControllerAxisInput *axis, float value) {
+		AxisInput axisInput;
+		axisInput.deviceId = DEVICE_ID_PAD_0;
+		axisInput.flags = 0;
+		axisInput.axisId = JOYSTICK_AXIS_RZ;
+		axisInput.value = -value * g_Config.fXInputAnalogSensitivity;
+		NativeAxis(axisInput);
+	};
 }
 #endif
 

@@ -15,27 +15,15 @@
 // Official SVN repository and contact information can be found at
 // http://code.google.com/p/dolphin-emu/
 
-#ifndef _COMMON_H_
-#define _COMMON_H_
+#pragma once
 
 // DO NOT EVER INCLUDE <windows.h> directly _or indirectly_ from this file
 // since it slows down the build a lot.
 
-#include <stdlib.h>
 #include <stdarg.h>
 
 #ifdef _MSC_VER
 #pragma warning (disable:4100)
-#endif
-
-#ifdef __arm__
-#if !defined(ARM)
-#define ARM
-#endif
-#endif
-
-#if defined(ARM)
-#define _M_ARM32
 #endif
 
 // Force enable logging in the right modes. For some reason, something had changed
@@ -47,19 +35,15 @@
 
 #define STACKALIGN
 
-// An inheritable class to disallow the copy constructor and operator= functions
-class NonCopyable
-{
-protected:
-	NonCopyable() {}
-private:
-	NonCopyable(const NonCopyable&);
-	void operator=(const NonCopyable&);
-};
-
 #include "Log.h"
 #include "CommonTypes.h"
 #include "CommonFuncs.h"
+
+#ifndef DISALLOW_COPY_AND_ASSIGN
+#define DISALLOW_COPY_AND_ASSIGN(t) \
+	t(const t &other) = delete;  \
+	void operator =(const t &other) = delete;
+#endif
 
 #ifdef __APPLE__
 // The Darwin ABI requires that stack frames be aligned to 16-byte boundaries.
@@ -73,23 +57,10 @@ private:
 
 #elif defined(_WIN32)
 
-// Check MSC ver
-	#if !defined _MSC_VER || _MSC_VER <= 1000
-		#error needs at least version 1000 of MSC
-	#endif
-
 // Memory leak checks
 	#define CHECK_HEAP_INTEGRITY()
 
-// Alignment
-	#define MEMORY_ALIGNED16(x) __declspec(align(16)) x
-	#define GC_ALIGNED32(x) __declspec(align(32)) x
-	#define GC_ALIGNED64(x) __declspec(align(64)) x
-	#define GC_ALIGNED128(x) __declspec(align(128)) x
-	#define GC_ALIGNED16_DECL(x) __declspec(align(16)) x
-	#define GC_ALIGNED64_DECL(x) __declspec(align(64)) x
-
-// Debug definitions
+	// Debug definitions
 	#if defined(_DEBUG)
 		#include <crtdbg.h>
 		#undef CHECK_HEAP_INTEGRITY
@@ -107,32 +78,13 @@ private:
 #ifndef MAX_PATH
 #define MAX_PATH PATH_MAX
 #endif
-#ifdef _LP64
-#define _M_X64 1
-#else
-#ifndef _M_ARM32
-#define _M_IX86 1
-#endif
-#endif
 
 #define __forceinline inline __attribute__((always_inline))
-#define MEMORY_ALIGNED16(x) __attribute__((aligned(16))) x
-#define GC_ALIGNED32(x) __attribute__((aligned(32))) x
-#define GC_ALIGNED64(x) __attribute__((aligned(64))) x
-#define GC_ALIGNED128(x) __attribute__((aligned(128))) x
-#define GC_ALIGNED16_DECL(x) __attribute__((aligned(16))) x
-#define GC_ALIGNED64_DECL(x) __attribute__((aligned(64))) x
 #endif
 
-#ifdef _MSC_VER
-#define __getcwd _getcwd
-#define __chdir _chdir
+#if !defined(__GNUC__) && (defined(_M_X64) || defined(_M_IX86))
+# define _M_SSE 0x402
 #else
-#define __getcwd getcwd
-#define __chdir chdir
-#endif
-
-#if defined __GNUC__
 # if defined __SSE4_2__
 #  define _M_SSE 0x402
 # elif defined __SSE4_1__
@@ -144,10 +96,4 @@ private:
 # elif defined __SSE2__
 #  define _M_SSE 0x200
 # endif
-#elif ((_MSC_VER >= 1500) || __INTEL_COMPILER) && !defined(_XBOX) // Visual Studio 2008
-# define _M_SSE 0x402
 #endif
-
-#include "Swap.h"
-
-#endif // _COMMON_H_

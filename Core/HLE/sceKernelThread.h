@@ -26,6 +26,8 @@
 // There's a good description of the thread scheduling rules in:
 // http://code.google.com/p/jpcsp/source/browse/trunk/src/jpcsp/HLE/modules150/ThreadManForUser.java
 
+class Thread;
+
 int sceKernelChangeThreadPriority(SceUID threadID, int priority);
 SceUID __KernelCreateThreadInternal(const char *threadName, SceUID moduleID, u32 entry, u32 prio, int stacksize, u32 attr);
 int __KernelCreateThread(const char *threadName, SceUID moduleID, u32 entry, u32 prio, int stacksize, u32 attr, u32 optionAddr);
@@ -41,8 +43,10 @@ void sceKernelExitDeleteThread(int exitStatus);
 void sceKernelExitThread(int exitStatus);
 void _sceKernelExitThread(int exitStatus);
 SceUID sceKernelGetThreadId();
-void sceKernelGetThreadCurrentPriority();
+int sceKernelGetThreadCurrentPriority();
+// Warning: will alter v0 in current MIPS state.
 int __KernelStartThread(SceUID threadToStartID, int argSize, u32 argBlockPtr, bool forceArgs = false);
+int __KernelStartThreadValidate(SceUID threadToStartID, int argSize, u32 argBlockPtr, bool forceArgs = false);
 int sceKernelStartThread(SceUID threadToStartID, int argSize, u32 argBlockPtr);
 u32 sceKernelSuspendDispatchThread();
 u32 sceKernelResumeDispatchThread(u32 suspended);
@@ -135,8 +139,8 @@ struct ThreadContext
 		struct {
 			u32 pc;
 
-			u32 hi;
 			u32 lo;
+			u32 hi;
 
 			u32 fcr31;
 			u32 fpcond;
@@ -157,6 +161,7 @@ KernelObject *__KernelCallbackObject();
 void __KernelScheduleWakeup(int threadnumber, s64 usFromNow);
 SceUID __KernelGetCurThread();
 u32 __KernelGetCurThreadStack();
+u32 __KernelGetCurThreadStackStart();
 const char *__KernelGetThreadName(SceUID threadID);
 
 void __KernelSaveContext(ThreadContext *ctx, bool vfpuEnabled);
@@ -219,7 +224,6 @@ bool __KernelInCallback();
 bool __KernelCheckCallbacks();
 bool __KernelForceCallbacks();
 bool __KernelCurHasReadyCallbacks();
-class Thread;
 void __KernelSwitchContext(Thread *target, const char *reason);
 bool __KernelExecutePendingMipsCalls(Thread *currentThread, bool reschedAfter);
 void __KernelNotifyCallback(SceUID cbId, int notifyArg);
@@ -251,7 +255,6 @@ struct MipsCall {
 	u32 args[6];
 	int numArgs;
 	Action *doAfter;
-	u32 savedRa;
 	u32 savedPc;
 	u32 savedV0;
 	u32 savedV1;
@@ -317,3 +320,8 @@ void __KernelChangeThreadState(SceUID threadId, ThreadStatus newStatus);
 
 int LoadExecForUser_362A956B();
 int sceKernelRegisterExitCallback(SceUID cbId);
+
+KernelObject *__KernelThreadEventHandlerObject();
+SceUID sceKernelRegisterThreadEventHandler(const char *name, SceUID threadID, u32 mask, u32 handlerPtr, u32 commonArg);
+int sceKernelReleaseThreadEventHandler(SceUID uid);
+int sceKernelReferThreadEventHandlerStatus(SceUID uid, u32 infoPtr);

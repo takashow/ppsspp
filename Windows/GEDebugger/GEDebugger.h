@@ -18,7 +18,7 @@
 #pragma once
 
 #include "Common/CommonWindows.h"
-#include "Globals.h"
+#include "GPU/Common/GPUDebugInterface.h"
 #include "Windows/resource.h"
 #include "Windows/W32Util/DialogManager.h"
 #include "Windows/W32Util/TabControl.h"
@@ -31,6 +31,7 @@ enum {
 	WM_GEDBG_TOGGLEPCBREAKPOINT,
 	WM_GEDBG_RUNTOWPARAM,
 	WM_GEDBG_SETCMDWPARAM,
+	WM_GEDBG_UPDATE_WATCH,
 };
 
 enum BreakNextType {
@@ -51,6 +52,8 @@ class TabStateTexture;
 class TabStateSettings;
 class TabVertices;
 class TabMatrices;
+class TabStateWatch;
+struct GPUgstate;
 
 class CGEDebugger : public Dialog {
 public:
@@ -65,26 +68,48 @@ protected:
 private:
 	void SetupPreviews();
 	void UpdatePreviews();
-	void UpdatePrimPreview(u32 op);
+	void UpdatePrimaryPreview(const GPUgstate &state);
+	void UpdateSecondPreview(const GPUgstate &state);
+	u32 PrimPreviewOp();
+	void UpdatePrimPreview(u32 op, int which);
 	void CleanupPrimPreview();
+	void HandleRedraw(int which);
 	void UpdateSize(WORD width, WORD height);
 	void SavePosition();
 	void SetBreakNext(BreakNextType type);
 	void UpdateTextureLevel(int level);
+	void DescribePrimaryPreview(const GPUgstate &state, wchar_t desc[256]);
+	void DescribeSecondPreview(const GPUgstate &state, wchar_t desc[256]);
+	void PrimaryPreviewHover(int x, int y);
+	void SecondPreviewHover(int x, int y);
+	void PreviewExport(const GPUDebugBuffer *buffer);
+	void DescribePixel(u32 pix, GPUDebugBufferFormat fmt, int x, int y, wchar_t desc[256]);
+	void DescribePixelRGBA(u32 pix, GPUDebugBufferFormat fmt, int x, int y, wchar_t desc[256]);
 
-	CtrlDisplayListView *displayList;
-	TabDisplayLists *lists;
-	TabStateFlags *flags;
-	TabStateLighting *lighting;
-	TabStateTexture *textureState;
-	TabStateSettings *settings;
-	TabVertices *vertices;
-	TabMatrices *matrices;
-	SimpleGLWindow *frameWindow;
-	SimpleGLWindow *texWindow;
-	TabControl *tabs;
-	TabControl *fbTabs;
-	int textureLevel_;
+	u32 TexturePreviewFlags(const GPUgstate &state);
 
-	int minWidth,minHeight;
+	CtrlDisplayListView *displayList = nullptr;
+	TabDisplayLists *lists = nullptr;
+	TabStateFlags *flags = nullptr;
+	TabStateLighting *lighting = nullptr;
+	TabStateTexture *textureState = nullptr;
+	TabStateSettings *settings = nullptr;
+	TabVertices *vertices = nullptr;
+	TabMatrices *matrices = nullptr;
+	SimpleGLWindow *primaryWindow = nullptr;
+	SimpleGLWindow *secondWindow = nullptr;
+	TabStateWatch *watch = nullptr;
+	TabControl *tabs = nullptr;
+	TabControl *fbTabs = nullptr;
+	int textureLevel_ = 0;
+	bool showClut_ = false;
+	bool forceOpaque_ = false;
+	// The most recent primary/framebuffer and texture buffers.
+	const GPUDebugBuffer *primaryBuffer_ = nullptr;
+	const GPUDebugBuffer *secondBuffer_ = nullptr;
+
+	bool updating_ = false;
+	int previewsEnabled_ = 3;
+	int minWidth_;
+	int minHeight_;
 };

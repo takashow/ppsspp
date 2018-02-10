@@ -50,7 +50,7 @@
 		<string>assets/Icon@2x.png</string>
 	</array>
 	<key>UILaunchImageFile</key>
-	<string>assets/Default.png</string>
+	<string>Default.png</string>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>UIDeviceFamily</key>
@@ -59,6 +59,6 @@
 		<integer>2</integer>
 	</array>
 	<key>UILaunchStoryboardName</key>
-	<string>LaunchScreen</string>
+	<string>Launch Screen</string>
 </dict>
 </plist>

@@ -15,7 +15,7 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
-
+#include "GPU/Common/DrawEngineCommon.h"
 #include "GPU/Null/NullGpu.h"
 #include "GPU/GPUState.h"
 #include "GPU/ge_constants.h"
@@ -25,7 +25,17 @@
 #include "Core/HLE/sceKernelInterrupt.h"
 #include "Core/HLE/sceGe.h"
 
-NullGPU::NullGPU() { }
+class NullDrawEngine : public DrawEngineCommon {
+public:
+	void DispatchFlush() override {
+	}
+	void DispatchSubmitPrim(void *verts, void *inds, GEPrimitiveType prim, int vertexCount, u32 vertType, int *bytesRead) override {
+	}
+};
+
+NullGPU::NullGPU() : GPUCommon(nullptr, nullptr) {
+	drawEngineCommon_ = new NullDrawEngine();
+}
 NullGPU::~NullGPU() { }
 
 void NullGPU::FastRunLoop(DisplayList &list) {
@@ -77,7 +87,6 @@ void NullGPU::ExecuteOp(u32 op, u32 diff) {
 		}
 		break;
 
-	// The arrow and other rotary items in Puzbob are bezier patches, strangely enough.
 	case GE_CMD_BEZIER:
 		{
 			int bz_ucount = data & 0xFF;
@@ -92,16 +101,18 @@ void NullGPU::ExecuteOp(u32 op, u32 diff) {
 			int sp_vcount = (data >> 8) & 0xFF;
 			int sp_utype = (data >> 16) & 0x3;
 			int sp_vtype = (data >> 18) & 0x3;
-			//drawSpline(sp_ucount, sp_vcount, sp_utype, sp_vtype);
 			DEBUG_LOG(G3D,"DL DRAW SPLINE: %i x %i, %i x %i", sp_ucount, sp_vcount, sp_utype, sp_vtype);
 		}
 		break;
 
 	case GE_CMD_BOUNDINGBOX:
-		if (data != 0)
+		if (data != 0) {
 			DEBUG_LOG(G3D, "Unsupported bounding box: %06x", data);
-		// bounding box test. Let's assume the box was within the drawing region.
-		currentList->bboxResult = true;
+			// Bounding box test. Let's assume the box was within the drawing region.
+			currentList->bboxResult = true;
+		} else {
+			currentList->bboxResult = false;
+		}
 		break;
 
 	case GE_CMD_VERTEXTYPE:
@@ -216,7 +227,7 @@ void NullGPU::ExecuteOp(u32 op, u32 diff) {
 		break;
 
 	case GE_CMD_TEXADDR0:
-		gstate_c.textureChanged = TEXCHANGE_UPDATED;
+		gstate_c.Dirty(DIRTY_TEXTURE_IMAGE);
 	case GE_CMD_TEXADDR1:
 	case GE_CMD_TEXADDR2:
 	case GE_CMD_TEXADDR3:
@@ -228,7 +239,7 @@ void NullGPU::ExecuteOp(u32 op, u32 diff) {
 		break;
 
 	case GE_CMD_TEXBUFWIDTH0:
-		gstate_c.textureChanged = TEXCHANGE_UPDATED;
+		gstate_c.Dirty(DIRTY_TEXTURE_IMAGE);
 	case GE_CMD_TEXBUFWIDTH1:
 	case GE_CMD_TEXBUFWIDTH2:
 	case GE_CMD_TEXBUFWIDTH3:
@@ -344,7 +355,7 @@ void NullGPU::ExecuteOp(u32 op, u32 diff) {
 		}
 
 	case GE_CMD_TEXSIZE0:
-		gstate_c.textureChanged = TEXCHANGE_UPDATED;
+		gstate_c.Dirty(DIRTY_TEXTURE_IMAGE);
 		gstate_c.curTextureWidth = 1 << (gstate.texsize[0] & 0xf);
 		gstate_c.curTextureHeight = 1 << ((gstate.texsize[0]>>8) & 0xf);
 		//fall thru - ignoring the mipmap sizes for now
@@ -459,13 +470,13 @@ void NullGPU::ExecuteOp(u32 op, u32 diff) {
 	}
 		break;
 
-	case GE_CMD_VIEWPORTX1:
-	case GE_CMD_VIEWPORTY1:
-	case GE_CMD_VIEWPORTZ1:
-	case GE_CMD_VIEWPORTX2:
-	case GE_CMD_VIEWPORTY2:
-	case GE_CMD_VIEWPORTZ2:
-		DEBUG_LOG(G3D,"DL Viewport param %i: %f", cmd-GE_CMD_VIEWPORTX1, getFloat24(data));
+	case GE_CMD_VIEWPORTXSCALE:
+	case GE_CMD_VIEWPORTYSCALE:
+	case GE_CMD_VIEWPORTZSCALE:
+	case GE_CMD_VIEWPORTXCENTER:
+	case GE_CMD_VIEWPORTYCENTER:
+	case GE_CMD_VIEWPORTZCENTER:
+		DEBUG_LOG(G3D,"DL Viewport param %i: %f", cmd-GE_CMD_VIEWPORTXSCALE, getFloat24(data));
 		break;
 	case GE_CMD_LIGHTENABLE0:
 	case GE_CMD_LIGHTENABLE1:
@@ -676,15 +687,16 @@ void NullGPU::ExecuteOp(u32 op, u32 diff) {
 	}
 }
 
-void NullGPU::UpdateStats() {
-	gpuStats.numVertexShaders = 0;
-	gpuStats.numFragmentShaders = 0;
-	gpuStats.numShaders = 0;
-	gpuStats.numTextures = 0;
+void NullGPU::GetStats(char *buffer, size_t bufsize) {
+	snprintf(buffer, bufsize, "NullGPU: (N/A)");
 }
 
 void NullGPU::InvalidateCache(u32 addr, int size, GPUInvalidationType type) {
 	// Nothing to invalidate.
+}
+
+void NullGPU::NotifyVideoUpload(u32 addr, int size, int width, int format) {
+	// Nothing to do.
 }
 
 bool NullGPU::PerformMemoryCopy(u32 dest, u32 src, int size) {
@@ -713,4 +725,8 @@ bool NullGPU::PerformMemoryUpload(u32 dest, int size) {
 
 bool NullGPU::PerformStencilUpload(u32 dest, int size) {
 	return false;
+}
+
+bool NullGPU::FramebufferReallyDirty() {
+	return !(gstate_c.skipDrawReason & SKIPDRAW_SKIPFRAME);
 }

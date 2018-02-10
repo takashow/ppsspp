@@ -16,6 +16,8 @@
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
 #pragma once
+
+#include <vector>
 #include <InitGuid.h>
 #define DIRECTINPUT_VERSION 0x0800
 #define DIRECTINPUT_RGBBUTTONS_MAX 128
@@ -30,11 +32,11 @@ public:
 	//getDevices(), enumerates all devices if not done yet
 	DinputDevice(int devnum);
 	~DinputDevice();
-	virtual int UpdateState(InputState &input_state);
+	virtual int UpdateState();
 	virtual bool IsPad() { return true; }
 	static size_t getNumPads();
 private:
-	void ApplyButtons(DIJOYSTATE2 &state, InputState &input_state);
+	void ApplyButtons(DIJOYSTATE2 &state);
 	//unfortunate and unclean way to keep only one DirectInput instance around
 	static LPDIRECTINPUT8 getPDI();
 	//unfortunate and unclean way to keep track of the number of devices and the

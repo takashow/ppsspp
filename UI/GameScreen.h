@@ -17,8 +17,9 @@
 
 #pragma once
 
+#include <functional>
+
 #include "UI/MiscScreens.h"
-#include "base/functional.h"
 #include "ui/ui_screen.h"
 
 // Game screen: Allows you to start a game, delete saves, delete the game,
@@ -32,15 +33,20 @@ public:
 	GameScreen(const std::string &gamePath);
 	~GameScreen();
 
-	virtual void update(InputState &input);
+	void update() override;
+
+	std::string tag() const override { return "game"; }
 
 protected:
-	virtual void CreateViews();
+	void CreateViews() override;
+	void CallbackDeleteConfig(bool yes);
 	void CallbackDeleteSaveData(bool yes);
 	void CallbackDeleteGame(bool yes);
 	bool isRecentGame(const std::string &gamePath);
 
 private:
+	UI::Choice *AddOtherChoice(UI::Choice *choice);
+
 	// Event handlers
 	UI::EventReturn OnPlay(UI::EventParams &e);
 	UI::EventReturn OnGameSettings(UI::EventParams &e);
@@ -50,12 +56,24 @@ private:
 	UI::EventReturn OnCreateShortcut(UI::EventParams &e);
 	UI::EventReturn OnRemoveFromRecent(UI::EventParams &e);
 	UI::EventReturn OnShowInFolder(UI::EventParams &e);
+	UI::EventReturn OnCreateConfig(UI::EventParams &e);
+	UI::EventReturn OnDeleteConfig(UI::EventParams &e);
+	UI::EventReturn OnCwCheat(UI::EventParams &e);
+	UI::EventReturn OnSetBackground(UI::EventParams &e);
 
 	// As we load metadata in the background, we need to be able to update these after the fact.
-	UI::Thin3DTextureView *texvGameIcon_;
+	UI::TextureView *texvGameIcon_;
 	UI::TextView *tvTitle_;
 	UI::TextView *tvGameSize_;
 	UI::TextView *tvSaveDataSize_;
 	UI::TextView *tvInstallDataSize_;
 	UI::TextView *tvRegion_;
+
+	UI::Choice *btnGameSettings_;
+	UI::Choice *btnCreateGameConfig_;
+	UI::Choice *btnDeleteGameConfig_;
+	UI::Choice *btnDeleteSaveData_;
+	UI::Choice *btnSetBackground_;
+	std::vector<UI::Choice *> otherChoices_;
+	std::vector<std::string> saveDirs;
 };

@@ -18,17 +18,16 @@
 #pragma once
 
 #include "Core/Host.h"
+#include "UI/OnScreenDisplay.h"
 
 #if !defined(MOBILE_DEVICE) && defined(USING_QT_UI)
 #include "Core/Debugger/SymbolMap.h"
 #include "Qt/mainwindow.h"
 #endif
 
-// TODO: Get rid of this junk
 class NativeHost : public Host {
 public:
-	NativeHost() {
-	}
+	NativeHost() {}
 
 	void UpdateUI() override {}
 
@@ -37,10 +36,10 @@ public:
 
 	void SetDebugMode(bool mode) override { }
 
-	bool InitGraphics(std::string *error_message) override { return true; }
+	bool InitGraphics(std::string *error_message, GraphicsContext **ctx) override { return true; }
 	void ShutdownGraphics() override {}
 
-	void InitSound(PMixer *mixer) override;
+	void InitSound() override;
 	void UpdateSound() override {}
 	void ShutdownSound() override;
 
@@ -50,6 +49,14 @@ public:
 	bool IsDebuggingEnabled() override {return false;}
 	bool AttemptLoadSymbolMap() override {return false;}
 	void SetWindowTitle(const char *message) override {}
+
+	void NotifyUserMessage(const std::string &message, float duration = 1.0f, u32 color = 0x00FFFFFF, const char *id = nullptr) override {
+		osm.Show(message, duration, color, -1, true, id);
+	}
+
+	void SendUIMessage(const std::string &message, const std::string &value) override {
+		NativeMessageReceived(message.c_str(), value.c_str());
+	}
 };
 
 #if !defined(MOBILE_DEVICE) && defined(USING_QT_UI)
@@ -93,17 +100,17 @@ public:
 			mainWindow->GetDialogDisasm()->SetDebugMode(mode);
 	}
 
-	virtual bool InitGraphics(std::string *error_message) override { return true; }
+	virtual bool InitGraphics(std::string *error_message, GraphicsContext **ctx) override { return true; }
 	virtual void ShutdownGraphics() override {}
 
-	virtual void InitSound(PMixer *mixer) override;
+	virtual void InitSound() override;
 	virtual void UpdateSound() override {}
 	virtual void ShutdownSound();
 
 	// this is sent from EMU thread! Make sure that Host handles it properly!
 	virtual void BootDone() {
-		symbolMap.SortSymbols();
-		mainWindow->Boot();
+		g_symbolMap->SortSymbols();
+		mainWindow->Notify(MainWindowMsg::BOOT_DONE);
 	}
 
 	virtual bool IsDebuggingEnabled() {
@@ -114,10 +121,13 @@ public:
 #endif
 	}
 	virtual bool AttemptLoadSymbolMap() {
-		return symbolMap.LoadSymbolMap(SymbolMapFilename(PSP_CoreParameter().fileToStart));
+		return false;
+		// TODO: Make this work with Qt and threaded GL... not sure what's so broken.
+		// auto fn = SymbolMapFilename(PSP_CoreParameter().fileToStart);
+		// return g_symbolMap->LoadSymbolMap(fn);
 	}
 	virtual void PrepareShutdown() {
-		symbolMap.SaveSymbolMap(SymbolMapFilename(PSP_CoreParameter().fileToStart));
+		g_symbolMap->SaveSymbolMap(SymbolMapFilename(PSP_CoreParameter().fileToStart));
 	}
 	virtual void ResetSymbolMap() {}
 	virtual void AddSymbol(std::string name, u32 addr, u32 size, int type=0) {}
@@ -126,6 +136,15 @@ public:
 
 		mainWindow->setWindowTitle(title);
 	}
+
+	void NotifyUserMessage(const std::string &message, float duration = 1.0f, u32 color = 0x00FFFFFF, const char *id = nullptr) override {
+		osm.Show(message, duration, color, -1, true, id);
+	}
+
+	void SendUIMessage(const std::string &message, const std::string &value) override {
+		NativeMessageReceived(message.c_str(), value.c_str());
+	}
+
 	bool GPUDebuggingActive()
 	{
 		auto dialogDisplayList = mainWindow->GetDialogDisplaylist();

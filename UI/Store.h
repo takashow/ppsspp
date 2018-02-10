@@ -17,12 +17,12 @@
 
 #pragma once
 
-#include "base/functional.h"
+#include <functional>
+
 #include "ui/ui_screen.h"
 #include "ui/viewgroup.h"
 #include "net/http_client.h"
 
-#include "Core/Util/GameManager.h"
 #include "UI/MiscScreens.h"
 
 // Game screen: Allows you to start a game, delete saves, delete the game,
@@ -30,6 +30,7 @@
 // Uses GameInfoCache heavily to implement the functionality.
 
 struct json_value;
+class ProductItemView;
 
 enum EntryType {
 	ENTRY_PBPZIP,
@@ -49,6 +50,7 @@ struct StoreEntry {
 	std::string file;  // This is the folder name of the installed one too, and hence a "unique-ish" identifier.
 	std::string category;
 	std::string downloadURL;  // Only set for games that are not hosted on store.ppsspp.org
+	bool hidden;
 	u64 size;
 };
 
@@ -61,18 +63,19 @@ public:
 	StoreScreen();
 	~StoreScreen();
 
-	virtual void update(InputState &input);
-	virtual std::string tag() const { return "store"; }
+	void update() override;
+	std::string tag() const override { return "store"; }
 
 protected:
-	virtual void CreateViews();
+	void CreateViews() override;
 	UI::EventReturn OnGameSelected(UI::EventParams &e);
-	UI::EventReturn OnCategorySelected(UI::EventParams &e);
 	UI::EventReturn OnRetry(UI::EventParams &e);
+	UI::EventReturn OnGameLaunch(UI::EventParams &e);
 
 private:
 	void SetFilter(const StoreFilter &filter);
 	void ParseListing(std::string json);
+	ProductItemView *GetSelectedItem();
 	std::vector<StoreEntry> FilterEntries();
 
 	std::string GetStoreJsonURL(std::string storePath) const;
@@ -85,8 +88,8 @@ private:
 	// local filesystems at the moment.
 	std::string storePath_;
 
-	bool loading_;
-	bool connectionError_;
+	bool loading_ = true;
+	bool connectionError_ = false;
 
 	std::map<std::string, StoreCategory> categories_;
 
@@ -96,7 +99,10 @@ private:
 
 	StoreFilter filter_;
 	std::string lang_;
+	std::string lastSelectedName_;
 
+	UI::ViewGroup *scrollItemView_;
 	UI::ViewGroup *productPanel_;
+	UI::TextView *titleText_;
 };
 

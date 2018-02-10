@@ -19,8 +19,10 @@
 #pragma once
 
 #include "Common/Common.h"
+#include "Core/MIPS/MIPS.h"
 
 struct JitBlock;
+class JitBlockCache;
 
 namespace MIPSComp {
 
@@ -54,14 +56,10 @@ namespace MIPSComp {
 			AFTER_MEMCHECK_CLEANUP = 0x04,
 		};
 
-		JitState()
-			: startDefaultPrefix(true),
-			prefixSFlag(PREFIX_UNKNOWN),
-			prefixTFlag(PREFIX_UNKNOWN),
-			prefixDFlag(PREFIX_UNKNOWN) {}
-
 		u32 compilerPC;
 		u32 blockStart;
+		u32 lastContinuedPC;
+		u32 initialBlockSize;
 		int nextExit;
 		bool cancel;
 		bool inDelaySlot;
@@ -70,16 +68,22 @@ namespace MIPSComp {
 		int downcountAmount;
 		int numInstructions;
 		bool compiling;	// TODO: get rid of this in favor of using analysis results to determine end of block
+		bool hadBreakpoints;
+		bool preloading = false;
 		JitBlock *curBlock;
 
+		u8 hasSetRounding = 0;
+		u8 lastSetRounding = 0;
+		const u8 *currentRoundingFunc = nullptr;
+
 		// VFPU prefix magic
-		bool startDefaultPrefix;
+		bool startDefaultPrefix = true;
 		u32 prefixS;
 		u32 prefixT;
 		u32 prefixD;
-		PrefixState prefixSFlag;
-		PrefixState prefixTFlag;
-		PrefixState prefixDFlag;
+		PrefixState prefixSFlag = PREFIX_UNKNOWN;
+		PrefixState prefixTFlag = PREFIX_UNKNOWN;
+		PrefixState prefixDFlag = PREFIX_UNKNOWN;
 
 		void PrefixStart() {
 			if (startDefaultPrefix) {
@@ -168,4 +172,33 @@ namespace MIPSComp {
 			}
 		}
 	};
+
+	struct JitOptions {
+		JitOptions();
+
+		// x86
+		bool enableVFPUSIMD;
+		bool reserveR15ForAsm;
+
+		// ARM/ARM64
+		bool useBackJump;
+		bool useForwardJump;
+		bool cachePointers;
+		// ARM only
+		bool useNEONVFPU;
+		bool downcountInRegister;
+		// ARM64 only
+		bool useASIMDVFPU;
+		bool useStaticAlloc;
+		bool enablePointerify;
+
+		// Common
+		bool enableBlocklink;
+		bool immBranches;
+		bool continueBranches;
+		bool continueJumps;
+		int continueMaxInstructions;
+	};
+
 }
+

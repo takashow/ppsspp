@@ -18,6 +18,8 @@
 #pragma once
 
 #include <string>
+
+#include "Common/Swap.h"
 #include "Core/Dialog/PSPDialog.h"
 
 #define SCE_UTILITY_MSGDIALOG_OPTION_ERRORSOUND         0x00000000
@@ -60,15 +62,15 @@ public:
 	virtual ~PSPMsgDialog();
 
 	virtual int Init(unsigned int paramAddr);
-	virtual int Update(int animSpeed);
-	virtual int Shutdown(bool force = false);
-	virtual void DoState(PointerWrap &p);
-	virtual pspUtilityDialogCommon *GetCommonParam();
+	virtual int Update(int animSpeed) override;
+	virtual int Shutdown(bool force = false) override;
+	virtual void DoState(PointerWrap &p) override;
+	virtual pspUtilityDialogCommon *GetCommonParam() override;
 
 	int Abort();
 
 protected:
-	virtual bool UseAutoStatus() {
+	virtual bool UseAutoStatus() override {
 		return false;
 	}
 

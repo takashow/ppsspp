@@ -15,6 +15,16 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include "ppsspp_config.h"
+#if PPSSPP_ARCH(ARM)
+
+// This allows highlighting to work.  Yay.
+#ifdef __INTELLISENSE__
+#define ARM
+#endif
+
+#include <stddef.h>
+
 #include "base/logging.h"
 #include "Common/CPUDetect.h"
 #include "Core/Config.h"
@@ -28,11 +38,11 @@ bool NEONSkinning = false;
 bool NEONMorphing = false;
 
 // Used only in non-NEON mode.
-static float MEMORY_ALIGNED16(skinMatrix[12]);
+alignas(16) static float skinMatrix[12];
 
 // Will be used only in NEON mode.
-static float MEMORY_ALIGNED16(bones[16 * 8]);  // First two are kept in registers
-static float MEMORY_ALIGNED16(boneMask[4]) = {1.0f, 1.0f, 1.0f, 0.0f};
+alignas(16) static float bones[16 * 8];  // First two are kept in registers
+alignas(16) static float boneMask[4] = {1.0f, 1.0f, 1.0f, 0.0f};
 
 // NEON register allocation:
 // Q0: Texture scaling parameters
@@ -55,6 +65,13 @@ static const float by16384 = 1.0f / 16384.0f;
 static const float by32768 = 1.0f / 32768.0f;
 
 using namespace ArmGen;
+
+// NOTE: Avoid R9, it's dangerous on iOS.
+//
+// r0-r3: parameters
+// r4-r11: local vars. save, except R9.
+// r12: interprocedure scratch
+// r13: stack8
 
 static const ARMReg tempReg1 = R3;
 static const ARMReg tempReg2 = R4;
@@ -97,23 +114,20 @@ static const JitLookup jitLookup[] = {
 	{&VertexDecoder::Step_WeightsU8, &VertexDecoderJitCache::Jit_WeightsU8},
 	{&VertexDecoder::Step_WeightsU16, &VertexDecoderJitCache::Jit_WeightsU16},
 	{&VertexDecoder::Step_WeightsFloat, &VertexDecoderJitCache::Jit_WeightsFloat},
-
 	{&VertexDecoder::Step_WeightsU8Skin, &VertexDecoderJitCache::Jit_WeightsU8Skin},
 	{&VertexDecoder::Step_WeightsU16Skin, &VertexDecoderJitCache::Jit_WeightsU16Skin},
 	{&VertexDecoder::Step_WeightsFloatSkin, &VertexDecoderJitCache::Jit_WeightsFloatSkin},
 
-	{&VertexDecoder::Step_TcU8, &VertexDecoderJitCache::Jit_TcU8},
-	{&VertexDecoder::Step_TcU16, &VertexDecoderJitCache::Jit_TcU16},
 	{&VertexDecoder::Step_TcFloat, &VertexDecoderJitCache::Jit_TcFloat},
-	{&VertexDecoder::Step_TcU16Double, &VertexDecoderJitCache::Jit_TcU16Double},
+	{&VertexDecoder::Step_TcU8ToFloat, &VertexDecoderJitCache::Jit_TcU8ToFloat},
+	{&VertexDecoder::Step_TcU16ToFloat, &VertexDecoderJitCache::Jit_TcU16ToFloat},
 
 	{&VertexDecoder::Step_TcU8Prescale, &VertexDecoderJitCache::Jit_TcU8Prescale},
 	{&VertexDecoder::Step_TcU16Prescale, &VertexDecoderJitCache::Jit_TcU16Prescale},
 	{&VertexDecoder::Step_TcFloatPrescale, &VertexDecoderJitCache::Jit_TcFloatPrescale},
 
-	{&VertexDecoder::Step_TcU16Through, &VertexDecoderJitCache::Jit_TcU16Through},
 	{&VertexDecoder::Step_TcFloatThrough, &VertexDecoderJitCache::Jit_TcFloatThrough},
-	{&VertexDecoder::Step_TcU16ThroughDouble, &VertexDecoderJitCache::Jit_TcU16ThroughDouble},
+	{&VertexDecoder::Step_TcU16ThroughToFloat, &VertexDecoderJitCache::Jit_TcU16ThroughToFloat},
 
 	{&VertexDecoder::Step_NormalS8, &VertexDecoderJitCache::Jit_NormalS8},
 	{&VertexDecoder::Step_NormalS16, &VertexDecoderJitCache::Jit_NormalS16},
@@ -154,8 +168,9 @@ static const JitLookup jitLookup[] = {
 	{&VertexDecoder::Step_Color5551Morph, &VertexDecoderJitCache::Jit_Color5551Morph},
 };
 
-JittedVertexDecoder VertexDecoderJitCache::Compile(const VertexDecoder &dec) {
+JittedVertexDecoder VertexDecoderJitCache::Compile(const VertexDecoder &dec, int32_t *jittedSize) {
 	dec_ = &dec;
+	BeginWrite();
 	const u8 *start = AlignCode16();
 
 	bool prescaleStep = false;
@@ -178,9 +193,12 @@ JittedVertexDecoder VertexDecoderJitCache::Compile(const VertexDecoder &dec) {
 		}
 	}
 
+	// Not used below, but useful for logging.
+	(void)skinning;
+
 	SetCC(CC_AL);
 
-	PUSH(6, R4, R5, R6, R7, R8, R_LR);
+	PUSH(8, R4, R5, R6, R7, R8, R10, R11, R_LR);
 	if (NEONSkinning || NEONMorphing) {
 		VPUSH(D8, 8);
 	}
@@ -220,7 +238,7 @@ JittedVertexDecoder VertexDecoderJitCache::Compile(const VertexDecoder &dec) {
 		MOVP2R(R4, bones);
 		MOVP2R(R5, boneMask);
 		VLD1(F_32, Q3, R5, 2, ALIGN_128);
-		for (int i = 0; i < 8; i++) {
+		for (int i = 0; i < dec.nweights; i++) {
 			VLD1(F_32, Q4, R3, 2);  // Load 128 bits even though we just want 96
 			VMUL(F_32, Q4, Q4, Q3);
 			ADD(R3, R3, 12);
@@ -255,14 +273,6 @@ JittedVertexDecoder VertexDecoderJitCache::Compile(const VertexDecoder &dec) {
 		}
 	}
 
-	// TODO: NEON skinning register mapping
-	// The matrix will be built in Q12-Q15.
-	// The temporary matrix to be added to the built matrix will be in Q8-Q11.
-
-	if (skinning) {
-		// TODO: Preload scale factors
-	}
-
 	if (dec.col) {
 		// Or LDB and skip the conditional?  This is probably cheaper.
 		MOV(fullAlphaReg, 0xFF);
@@ -273,11 +283,12 @@ JittedVertexDecoder VertexDecoderJitCache::Compile(const VertexDecoder &dec) {
 	PLD(srcReg, 64);
 	for (int i = 0; i < dec.numSteps_; i++) {
 		if (!CompileStep(dec, i)) {
+			EndWrite();
 			// Reset the code ptr and return zero to indicate that we failed.
 			SetCodePtr(const_cast<u8 *>(start));
 			char temp[1024] = {0};
 			dec.ToString(temp);
-			INFO_LOG(HLE, "Could not compile vertex decoder: %s", temp);
+			INFO_LOG(G3D, "Could not compile vertex decoder: %s", temp);
 			return 0;
 		}
 	}
@@ -298,7 +309,7 @@ JittedVertexDecoder VertexDecoderJitCache::Compile(const VertexDecoder &dec) {
 	if (NEONSkinning || NEONMorphing) {
 		VPOP(D8, 8);
 	}
-	POP(6, R4, R5, R6, R7, R8, R_PC);
+	POP(8, R4, R5, R6, R7, R8, R10, R11, R_PC);
 
 	FlushLitPool();
 	FlushIcache();
@@ -307,9 +318,11 @@ JittedVertexDecoder VertexDecoderJitCache::Compile(const VertexDecoder &dec) {
 	DisassembleArm(start, GetCodePtr() - start);
 	char temp[1024] = {0};
 	dec.ToString(temp);
-	INFO_LOG(HLE, "%s", temp);
+	INFO_LOG(G3D, "%s", temp);
 	*/
 
+	*jittedSize = GetCodePtr() - start;
+	EndWrite();
 	return (JittedVertexDecoder)start;
 }
 
@@ -548,21 +561,6 @@ void VertexDecoderJitCache::Jit_WeightsFloatSkin() {
 	Jit_ApplyWeights();
 }
 
-// Fill last two bytes with zeroes to align to 4 bytes. LDRH does it for us, handy.
-void VertexDecoderJitCache::Jit_TcU8() {
-	LDRB(tempReg1, srcReg, dec_->tcoff);
-	LDRB(tempReg2, srcReg, dec_->tcoff + 1);
-	ORR(tempReg1, tempReg1, Operand2(tempReg2, ST_LSL, 8));
-	STR(tempReg1, dstReg, dec_->decFmt.uvoff);
-}
-
-void VertexDecoderJitCache::Jit_TcU16() {
-	LDRH(tempReg1, srcReg, dec_->tcoff);
-	LDRH(tempReg2, srcReg, dec_->tcoff + 2);
-	ORR(tempReg1, tempReg1, Operand2(tempReg2, ST_LSL, 16));
-	STR(tempReg1, dstReg, dec_->decFmt.uvoff);
-}
-
 void VertexDecoderJitCache::Jit_TcFloat() {
 	LDR(tempReg1, srcReg, dec_->tcoff);
 	LDR(tempReg2, srcReg, dec_->tcoff + 4);
@@ -570,11 +568,41 @@ void VertexDecoderJitCache::Jit_TcFloat() {
 	STR(tempReg2, dstReg, dec_->decFmt.uvoff + 4);
 }
 
-void VertexDecoderJitCache::Jit_TcU16Through() {
+void VertexDecoderJitCache::Jit_TcU16ThroughToFloat() {
 	LDRH(tempReg1, srcReg, dec_->tcoff);
 	LDRH(tempReg2, srcReg, dec_->tcoff + 2);
-	ORR(tempReg1, tempReg1, Operand2(tempReg2, ST_LSL, 16));
-	STR(tempReg1, dstReg, dec_->decFmt.uvoff);
+
+	MOVP2R(scratchReg, &gstate_c.vertBounds.minU);
+
+	auto updateSide = [&](ARMReg r, CCFlags cc, u32 off) {
+		LDRH(tempReg3, scratchReg, off);
+		CMP(r, tempReg3);
+		SetCC(cc);
+		STRH(r, scratchReg, off);
+		SetCC(CC_AL);
+	};
+
+	// TODO: Can this actually be fast?  Hmm, floats aren't better.
+	updateSide(tempReg1, CC_LT, offsetof(KnownVertexBounds, minU));
+	updateSide(tempReg1, CC_GT, offsetof(KnownVertexBounds, maxU));
+	updateSide(tempReg2, CC_LT, offsetof(KnownVertexBounds, minV));
+	updateSide(tempReg2, CC_GT, offsetof(KnownVertexBounds, maxV));
+
+	if (cpu_info.bNEON) {
+		ADD(scratchReg, srcReg, dec_->tcoff);
+		VLD1_lane(I_32, neonScratchReg, scratchReg, 0, false);
+		VMOVL(I_16 | I_UNSIGNED, neonScratchRegQ, neonScratchReg);  // Widen to 32-bit
+		VCVT(F_32 | I_UNSIGNED, neonScratchRegQ, neonScratchRegQ);
+		ADD(scratchReg2, dstReg, dec_->decFmt.uvoff);
+		VST1(F_32, neonScratchReg, scratchReg2, 1, ALIGN_NONE);
+	} else {
+		VMOV(fpScratchReg, tempReg1);
+		VMOV(fpScratchReg2, tempReg2);
+		VCVT(fpScratchReg, fpScratchReg, TO_FLOAT);
+		VCVT(fpScratchReg2, fpScratchReg2, TO_FLOAT);
+		VSTR(fpScratchReg, dstReg, dec_->decFmt.uvoff);
+		VSTR(fpScratchReg2, dstReg, dec_->decFmt.uvoff + 4);
+	}
 }
 
 void VertexDecoderJitCache::Jit_TcFloatThrough() {
@@ -582,22 +610,6 @@ void VertexDecoderJitCache::Jit_TcFloatThrough() {
 	LDR(tempReg2, srcReg, dec_->tcoff + 4);
 	STR(tempReg1, dstReg, dec_->decFmt.uvoff);
 	STR(tempReg2, dstReg, dec_->decFmt.uvoff + 4);
-}
-
-void VertexDecoderJitCache::Jit_TcU16Double() {
-	LDRH(tempReg1, srcReg, dec_->tcoff);
-	LDRH(tempReg2, srcReg, dec_->tcoff + 2);
-	LSL(tempReg1, tempReg1, 1);
-	ORR(tempReg1, tempReg1, Operand2(tempReg2, ST_LSL, 17));
-	STR(tempReg1, dstReg, dec_->decFmt.uvoff);
-}
-
-void VertexDecoderJitCache::Jit_TcU16ThroughDouble() {
-	LDRH(tempReg1, srcReg, dec_->tcoff);
-	LDRH(tempReg2, srcReg, dec_->tcoff + 2);
-	LSL(tempReg1, tempReg1, 1);
-	ORR(tempReg1, tempReg1, Operand2(tempReg2, ST_LSL, 17));
-	STR(tempReg1, dstReg, dec_->decFmt.uvoff);
 }
 
 void VertexDecoderJitCache::Jit_TcU8Prescale() {
@@ -629,6 +641,33 @@ void VertexDecoderJitCache::Jit_TcU8Prescale() {
 	}
 }
 
+void VertexDecoderJitCache::Jit_TcU8ToFloat() {
+	if (cpu_info.bNEON) {
+		// TODO: Needs testing
+		ADD(scratchReg, srcReg, dec_->tcoff);
+		VLD1_lane(I_16, neonScratchReg, scratchReg, 0, false);
+		VMOVL(I_8 | I_UNSIGNED, neonScratchRegQ, neonScratchReg);  // Widen to 16-bit
+		VMOVL(I_16 | I_UNSIGNED, neonScratchRegQ, neonScratchReg);  // Widen to 32-bit
+		VCVT(F_32 | I_UNSIGNED, neonScratchRegQ, neonScratchRegQ);
+		VMOV_neon(F_32, neonScratchReg2, by128);
+		VMUL(F_32, neonScratchReg, neonScratchReg, neonScratchReg2);
+		ADD(scratchReg2, dstReg, dec_->decFmt.uvoff);
+		VST1(F_32, neonScratchReg, scratchReg2, 1, ALIGN_NONE);
+	} else {
+		LDRB(tempReg1, srcReg, dec_->tcoff);
+		LDRB(tempReg2, srcReg, dec_->tcoff + 1);
+		VMOV(fpScratchReg, tempReg1);
+		VMOV(fpScratchReg2, tempReg2);
+		VCVT(fpScratchReg, fpScratchReg, TO_FLOAT);
+		VCVT(fpScratchReg2, fpScratchReg2, TO_FLOAT);
+		MOVI2F(S15, by128, scratchReg);
+		VMUL(fpScratchReg, fpScratchReg, S15);
+		VMUL(fpScratchReg2, fpScratchReg2, S15);
+		VSTR(fpScratchReg, dstReg, dec_->decFmt.uvoff);
+		VSTR(fpScratchReg2, dstReg, dec_->decFmt.uvoff + 4);
+	}
+}
+
 void VertexDecoderJitCache::Jit_TcU16Prescale() {
 	if (cpu_info.bNEON) {
 		// TODO: Needs testing
@@ -651,6 +690,32 @@ void VertexDecoderJitCache::Jit_TcU16Prescale() {
 		VMUL(fpScratchReg2, fpScratchReg2, fpVscaleReg);
 		VADD(fpScratchReg, fpScratchReg, fpUoffsetReg);
 		VADD(fpScratchReg2, fpScratchReg2, fpVoffsetReg);
+		VSTR(fpScratchReg, dstReg, dec_->decFmt.uvoff);
+		VSTR(fpScratchReg2, dstReg, dec_->decFmt.uvoff + 4);
+	}
+}
+
+void VertexDecoderJitCache::Jit_TcU16ToFloat() {
+	if (cpu_info.bNEON) {
+		// TODO: Needs testing
+		ADD(scratchReg, srcReg, dec_->tcoff);
+		VLD1_lane(I_32, neonScratchReg, scratchReg, 0, false);
+		VMOVL(I_16 | I_UNSIGNED, neonScratchRegQ, neonScratchReg);  // Widen to 32-bit
+		VCVT(F_32 | I_UNSIGNED, neonScratchRegQ, neonScratchRegQ);
+		ADD(scratchReg2, dstReg, dec_->decFmt.uvoff);
+		VMOV_neon(F_32, neonScratchReg2, by32768);
+		VMUL(F_32, neonScratchReg, neonScratchReg, neonScratchReg2);
+		VST1(F_32, neonScratchReg, scratchReg2, 1, ALIGN_NONE);
+	} else {
+		LDRH(tempReg1, srcReg, dec_->tcoff);
+		LDRH(tempReg2, srcReg, dec_->tcoff + 2);
+		VMOV(fpScratchReg, tempReg1);
+		VMOV(fpScratchReg2, tempReg2);
+		VCVT(fpScratchReg, fpScratchReg, TO_FLOAT);
+		VCVT(fpScratchReg2, fpScratchReg2, TO_FLOAT);
+		MOVI2F(S15, by32768, scratchReg);
+		VMUL(fpScratchReg, fpScratchReg, S15);
+		VMUL(fpScratchReg2, fpScratchReg2, S15);
 		VSTR(fpScratchReg, dstReg, dec_->decFmt.uvoff);
 		VSTR(fpScratchReg2, dstReg, dec_->decFmt.uvoff + 4);
 	}
@@ -825,7 +890,7 @@ void VertexDecoderJitCache::Jit_Color8888Morph() {
 }
 
 // First is the left shift, second is the right shift (against walls, to get the RGBA values.)
-static const s16 MEMORY_ALIGNED16(color4444Shift[2][4]) = {{12, 8, 4, 0}, {-12, -12, -12, -12}};
+alignas(16) static const s16 color4444Shift[2][4] = {{12, 8, 4, 0}, {-12, -12, -12, -12}};
 
 void VertexDecoderJitCache::Jit_Color4444Morph() {
 	const bool useNEON = NEONMorphing;
@@ -907,8 +972,8 @@ void VertexDecoderJitCache::Jit_Color4444Morph() {
 }
 
 // First is the left shift, second is the right shift (against walls, to get the RGBA values.)
-static const s16 MEMORY_ALIGNED16(color565Shift[2][4]) = {{11, 5, 0, 0}, {-11, -10, -11, 0}};
-static const float MEMORY_ALIGNED16(byColor565[4]) = {255.0f / 31.0f, 255.0f / 63.0f, 255.0f / 31.0f, 0.0f};
+alignas(16) static const s16 color565Shift[2][4] = {{11, 5, 0, 0}, {-11, -10, -11, 0}};
+alignas(16) static const float byColor565[4] = {255.0f / 31.0f, 255.0f / 63.0f, 255.0f / 31.0f, 0.0f};
 
 void VertexDecoderJitCache::Jit_Color565Morph() {
 	const bool useNEON = NEONMorphing;
@@ -992,8 +1057,8 @@ void VertexDecoderJitCache::Jit_Color565Morph() {
 }
 
 // First is the left shift, second is the right shift (against walls, to get the RGBA values.)
-static const s16 MEMORY_ALIGNED16(color5551Shift[2][4]) = {{11, 6, 1, 0}, {-11, -11, -11, -15}};
-static const float MEMORY_ALIGNED16(byColor5551[4]) = {255.0f / 31.0f, 255.0f / 31.0f, 255.0f / 31.0f, 255.0f / 1.0f};
+alignas(16) static const s16 color5551Shift[2][4] = {{11, 6, 1, 0}, {-11, -11, -11, -15}};
+alignas(16) static const float byColor5551[4] = {255.0f / 31.0f, 255.0f / 31.0f, 255.0f / 31.0f, 255.0f / 1.0f};
 
 void VertexDecoderJitCache::Jit_Color5551Morph() {
 	const bool useNEON = NEONMorphing;
@@ -1151,7 +1216,7 @@ void VertexDecoderJitCache::Jit_PosS8Through() {
 	// TODO: SIMD
 	LDRSB(tempReg1, srcReg, dec_->posoff);
 	LDRSB(tempReg2, srcReg, dec_->posoff + 1);
-	LDRSB(tempReg3, srcReg, dec_->posoff + 2);
+	LDRSB(tempReg3, srcReg, dec_->posoff + 2);  // signed?
 	static const ARMReg tr[3] = { tempReg1, tempReg2, tempReg3 };
 	static const ARMReg fr[3] = { fpScratchReg, fpScratchReg2, fpScratchReg3 };
 	ADD(scratchReg, dstReg, dec_->decFmt.posoff);
@@ -1174,7 +1239,6 @@ void VertexDecoderJitCache::Jit_PosS16Through() {
 	_dbg_assert_msg_(JIT, fpScratchReg + 1 == fpScratchReg2, "VertexDecoder fpScratchRegs must be in order.");
 	_dbg_assert_msg_(JIT, fpScratchReg2 + 1 == fpScratchReg3, "VertexDecoder fpScratchRegs must be in order.");
 
-	// TODO: SIMD
 	LDRSH(tempReg1, srcReg, dec_->posoff);
 	LDRSH(tempReg2, srcReg, dec_->posoff + 2);
 	LDRH(tempReg3, srcReg, dec_->posoff + 4);
@@ -1586,3 +1650,5 @@ bool VertexDecoderJitCache::CompileStep(const VertexDecoder &dec, int step) {
 	}
 	return false;
 }
+
+#endif // PPSSPP_ARCH(ARM)

@@ -1,11 +1,8 @@
-[submodule "native"]
-	path = native
-	url = https://github.com/hrydgard/native.git
 [submodule "pspautotests"]
 	path = pspautotests
 	url = https://github.com/hrydgard/pspautotests.git
 [submodule "lang"]
-	path = lang
+	path = assets/lang
 	url = https://github.com/hrydgard/ppsspp-lang.git
 [submodule "ffmpeg"]
 	path = ffmpeg
@@ -13,6 +10,12 @@
 [submodule "dx9sdk"]
 	path = dx9sdk
 	url = https://github.com/hrydgard/minidx9.git
-[submodule "redist"]
-	path = redist
-	url = https://github.com/hrydgard/ppsspp-redist.git
+[submodule "ext/armips"]
+	path = ext/armips
+	url = https://github.com/Kingcom/armips
+[submodule "ext/glslang"]
+	path = ext/glslang
+	url = https://github.com/hrydgard/glslang.git
+[submodule "ext/SPIRV-Cross"]
+	path = ext/SPIRV-Cross
+	url = https://github.com/KhronosGroup/SPIRV-Cross.git

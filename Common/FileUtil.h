@@ -15,8 +15,7 @@
 // Official SVN repository and contact information can be found at
 // http://code.google.com/p/dolphin-emu/
 
-#ifndef _FILEUTIL_H_
-#define _FILEUTIL_H_
+#pragma once
 
 #include <fstream>
 #include <cstdio>
@@ -26,7 +25,7 @@
 
 #include "Common.h"
 
-#ifdef _WIN32
+#ifdef _MSC_VER
 inline struct tm* localtime_r(const time_t *clock, struct tm *result) {
 	if (localtime_s(result, clock) == 0)
 		return result;
@@ -34,8 +33,7 @@ inline struct tm* localtime_r(const time_t *clock, struct tm *result) {
 }
 #endif
 
-namespace File
-{
+namespace File {
 
 // FileSystem tree node/ 
 struct FSTEntry
@@ -45,6 +43,15 @@ struct FSTEntry
 	std::string physicalName;		// name on disk
 	std::string virtualName;		// name in FST names table
 	std::vector<FSTEntry> children;
+};
+
+struct FileDetails {
+	bool isDirectory;
+	u64 size;
+	uint64_t atime;
+	uint64_t mtime;
+	uint64_t ctime;
+	uint32_t access;  // st_mode & 0x1ff
 };
 
 // Mostly to handle utf-8 filenames better on Windows.
@@ -57,17 +64,23 @@ bool Exists(const std::string &filename);
 // Returns true if filename is a directory
 bool IsDirectory(const std::string &filename);
 
+// Returns file attributes.
+bool GetFileDetails(const std::string &filename, FileDetails *details);
+
+// Extracts the directory from a path.
+std::string GetDir(const std::string &path);
+
+// Extracts the filename from a path.
+std::string GetFilename(std::string path);
+
 // Returns struct with modification date of file
-tm GetModifTime(const std::string &filename);
+bool GetModifTime(const std::string &filename, tm &return_time);
 
 // Returns the size of filename (64bit)
-u64 GetSize(const std::string &filename);
-
-// Overloaded GetSize, accepts file descriptor
-u64 GetSize(const int fd);
+u64 GetFileSize(const std::string &filename);
 
 // Overloaded GetSize, accepts FILE*
-u64 GetSize(FILE *f);
+u64 GetFileSize(FILE *f);
 
 // Returns true if successful, or path already exists.
 bool CreateDir(const std::string &filename);
@@ -100,6 +113,9 @@ std::string GetCurrentDir();
 // Create directory and copy contents (does not overwrite existing files)
 void CopyDir(const std::string &source_path, const std::string &dest_path);
 
+// Opens ini file (cheats, texture replacements etc.)
+void openIniFile(const std::string fileName);
+
 // Set the current directory to given directory
 bool SetCurrentDir(const std::string &directory);
 
@@ -108,14 +124,16 @@ const std::string &GetExeDirectory();
 // simple wrapper for cstdlib file functions to
 // hopefully will make error checking easier
 // and make forgetting an fclose() harder
-class IOFile : NonCopyable
-{
+class IOFile {
 public:
 	IOFile();
 	IOFile(std::FILE* file);
 	IOFile(const std::string& filename, const char openmode[]);
-
 	~IOFile();
+
+	// Prevent copies.
+	IOFile(const IOFile &) = delete;
+	void operator=(const IOFile &) = delete;
 
 	bool Open(const std::string& filename, const char openmode[]);
 	bool Close();
@@ -168,18 +186,14 @@ public:
 
 	// clear error state
 	void Clear() {
-    m_good = true;
+		m_good = true;
 #undef clearerr
-    std::clearerr(m_file);
-  }
+		std::clearerr(m_file);
+	}
 
 private:
-	IOFile& operator=(const IOFile&) /*= delete*/;
-
-	std::FILE* m_file;
+	std::FILE *m_file;
 	bool m_good;
 };
 
 }  // namespace
-
-#endif

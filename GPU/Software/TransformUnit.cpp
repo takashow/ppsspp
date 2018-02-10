@@ -19,7 +19,7 @@
 #include "Core/Host.h"
 #include "Core/Config.h"
 #include "GPU/GPUState.h"
-#include "GPU/GLES/TransformPipeline.h"
+#include "GPU/Common/DrawEngineCommon.h"
 #include "GPU/Common/VertexDecoderCommon.h"
 #include "GPU/Common/SplineCommon.h"
 
@@ -27,8 +27,40 @@
 #include "GPU/Software/Clipper.h"
 #include "GPU/Software/Lighting.h"
 
-static u8 buf[65536 * 48];  // yolo
-static bool outside_range_flag = false;
+#define TRANSFORM_BUF_SIZE (65536 * 48)
+
+TransformUnit::TransformUnit() {
+	buf = (u8 *)AllocateMemoryPages(TRANSFORM_BUF_SIZE, MEM_PROT_READ | MEM_PROT_WRITE);
+}
+
+TransformUnit::~TransformUnit() {
+	FreeMemoryPages(buf, DECODED_VERTEX_BUFFER_SIZE);
+}
+
+SoftwareDrawEngine::SoftwareDrawEngine() {
+	// All this is a LOT of memory, need to see if we can cut down somehow.  Used for splines.
+	decoded = (u8 *)AllocateMemoryPages(DECODED_VERTEX_BUFFER_SIZE, MEM_PROT_READ | MEM_PROT_WRITE);
+	decIndex = (u16 *)AllocateMemoryPages(DECODED_INDEX_BUFFER_SIZE, MEM_PROT_READ | MEM_PROT_WRITE);
+	splineBuffer = (u8 *)AllocateMemoryPages(SPLINE_BUFFER_SIZE, MEM_PROT_READ | MEM_PROT_WRITE);
+}
+
+SoftwareDrawEngine::~SoftwareDrawEngine() {
+	FreeMemoryPages(decoded, DECODED_VERTEX_BUFFER_SIZE);
+	FreeMemoryPages(decIndex, DECODED_INDEX_BUFFER_SIZE);
+	FreeMemoryPages(splineBuffer, SPLINE_BUFFER_SIZE);
+}
+
+void SoftwareDrawEngine::DispatchFlush() {
+}
+
+void SoftwareDrawEngine::DispatchSubmitPrim(void *verts, void *inds, GEPrimitiveType prim, int vertexCount, u32 vertType, int *bytesRead) {
+	transformUnit.SubmitPrimitive(verts, inds, prim, vertexCount, vertType, bytesRead, this);
+}
+
+VertexDecoder *SoftwareDrawEngine::FindVertexDecoder(u32 vtype) {
+	const u32 vertTypeID = (vtype & 0xFFFFFF) | (gstate.getUVGenMode() << 24);
+	return DrawEngineCommon::GetVertexDecoder(vertTypeID);
+}
 
 WorldCoords TransformUnit::ModelToWorld(const ModelCoords& coords)
 {
@@ -55,47 +87,50 @@ ClipCoords TransformUnit::ViewToClip(const ViewCoords& coords)
 	return ClipCoords(projection_matrix * coords4);
 }
 
-// TODO: This is ugly
-static inline ScreenCoords ClipToScreenInternal(const ClipCoords& coords, bool set_flag = true)
-{
+static inline ScreenCoords ClipToScreenInternal(const ClipCoords& coords, bool *outside_range_flag) {
 	ScreenCoords ret;
-	// TODO: Check for invalid parameters (x2 < x1, etc)
-	float vpx1 = getFloat24(gstate.viewportx1);
-	float vpx2 = getFloat24(gstate.viewportx2);
-	float vpy1 = getFloat24(gstate.viewporty1);
-	float vpy2 = getFloat24(gstate.viewporty2);
-	float vpz1 = getFloat24(gstate.viewportz1);
-	float vpz2 = getFloat24(gstate.viewportz2);
 
-	float retx = coords.x * vpx1 / coords.w + vpx2;
-	float rety = coords.y * vpy1 / coords.w + vpy2;
-	float retz = coords.z * vpz1 / coords.w + vpz2;
+	// Parameters here can seem invalid, but the PSP is fine with negative viewport widths etc.
+	// The checking that OpenGL and D3D do is actually quite superflous as the calculations still "work"
+	// with some pretty crazy inputs, which PSP games are happy to do at times.
+	float xScale = gstate.getViewportXScale();
+	float xCenter = gstate.getViewportXCenter();
+	float yScale = gstate.getViewportYScale();
+	float yCenter = gstate.getViewportYCenter();
+	float zScale = gstate.getViewportZScale();
+	float zCenter = gstate.getViewportZCenter();
 
-	if (gstate.clipEnable & 0x1) {
-		if (retz < 0.f)
-			retz = 0.f;
-		if (retz > 65535.f)
-			retz = 65535.f;
+	float x = coords.x * xScale / coords.w + xCenter;
+	float y = coords.y * yScale / coords.w + yCenter;
+	float z = coords.z * zScale / coords.w + zCenter;
+
+	// This matches hardware tests - depth is clamped when this flag is on.
+	if (gstate.isClippingEnabled()) {
+		if (z < 0.f)
+			z = 0.f;
+		if (z > 65535.f)
+			z = 65535.f;
 	}
 
-	if (set_flag && (retx > 4095.9375f || rety > 4095.9375f || retx < 0 || rety < 0 || retz < 0 || retz > 65535.f))
-		outside_range_flag = true;
+	if (outside_range_flag && (x > 4095.9375f || y > 4095.9375f || x < 0 || y < 0 || z < 0 || z > 65535.f))
+		*outside_range_flag = true;
 
 	// 16 = 0xFFFF / 4095.9375
-	return ScreenCoords(retx * 16, rety * 16, retz);
+	// Round up at 0.625 to the nearest subpixel.
+	return ScreenCoords(x * 16.0f + 0.375f, y * 16.0f + 0.375f, z);
 }
 
 ScreenCoords TransformUnit::ClipToScreen(const ClipCoords& coords)
 {
-	return ClipToScreenInternal(coords, false);
+	return ClipToScreenInternal(coords, nullptr);
 }
 
 DrawingCoords TransformUnit::ScreenToDrawing(const ScreenCoords& coords)
 {
 	DrawingCoords ret;
 	// TODO: What to do when offset > coord?
-	ret.x = (((u32)coords.x - gstate.getOffsetX16()) / 16) & 0x3ff;
-	ret.y = (((u32)coords.y - gstate.getOffsetY16()) / 16) & 0x3ff;
+	ret.x = ((s32)coords.x - gstate.getOffsetX16()) / 16;
+	ret.y = ((s32)coords.y - gstate.getOffsetY16()) / 16;
 	ret.z = coords.z;
 	return ret;
 }
@@ -109,13 +144,13 @@ ScreenCoords TransformUnit::DrawingToScreen(const DrawingCoords& coords)
 	return ret;
 }
 
-static VertexData ReadVertex(VertexReader& vreader)
+VertexData TransformUnit::ReadVertex(VertexReader& vreader)
 {
 	VertexData vertex;
 
 	float pos[3];
 	// VertexDecoder normally scales z, but we want it unscaled.
-	vreader.ReadPosZ16(pos);
+	vreader.ReadPosThroughZ16(pos);
 
 	if (!gstate.isModeClear() && gstate.isTextureMapEnabled() && vreader.hasUV()) {
 		float uv[2];
@@ -141,7 +176,7 @@ static VertexData ReadVertex(VertexReader& vreader)
 
 		for (int i = 0; i < vertTypeGetNumBoneWeights(gstate.vertType); ++i) {
 			Mat3x3<float> bone(&gstate.boneMatrix[12*i]);
-			tmppos += (bone * ModelCoords(pos[0], pos[1], pos[2]) * W[i] + Vec3<float>(gstate.boneMatrix[12*i+9], gstate.boneMatrix[12*i+10], gstate.boneMatrix[12*i+11]));
+			tmppos += (bone * ModelCoords(pos[0], pos[1], pos[2]) + Vec3<float>(gstate.boneMatrix[12*i+9], gstate.boneMatrix[12*i+10], gstate.boneMatrix[12*i+11])) * W[i];
 			if (vreader.hasNormal())
 				tmpnrm += (bone * vertex.normal) * W[i];
 		}
@@ -172,21 +207,31 @@ static VertexData ReadVertex(VertexReader& vreader)
 	if (!gstate.isModeThrough()) {
 		vertex.modelpos = ModelCoords(pos[0], pos[1], pos[2]);
 		vertex.worldpos = WorldCoords(TransformUnit::ModelToWorld(vertex.modelpos));
-		vertex.clippos = ClipCoords(TransformUnit::ViewToClip(TransformUnit::WorldToView(vertex.worldpos)));
-		vertex.screenpos = ClipToScreenInternal(vertex.clippos);
+		ModelCoords viewpos = TransformUnit::WorldToView(vertex.worldpos);
+		vertex.clippos = ClipCoords(TransformUnit::ViewToClip(viewpos));
+		if (gstate.isFogEnabled()) {
+			// TODO: Validate inf/nan.
+			vertex.fogdepth = (viewpos.z + getFloat24(gstate.fog1)) * getFloat24(gstate.fog2);
+		} else {
+			vertex.fogdepth = 1.0f;
+		}
+		vertex.screenpos = ClipToScreenInternal(vertex.clippos, &outside_range_flag);
 
 		if (vreader.hasNormal()) {
 			vertex.worldnormal = TransformUnit::ModelToWorldNormal(vertex.normal);
 			// TODO: Isn't there a flag that controls whether to normalize the normal?
 			vertex.worldnormal /= vertex.worldnormal.Length();
+		} else {
+			vertex.worldnormal = Vec3<float>(0.0f, 0.0f, 1.0f);
 		}
 
 		Lighting::Process(vertex, vreader.hasColor0());
 	} else {
-		vertex.screenpos.x = (u32)pos[0] * 16 + gstate.getOffsetX16();
-		vertex.screenpos.y = (u32)pos[1] * 16 + gstate.getOffsetY16();
+		vertex.screenpos.x = (int)(pos[0] * 16) + gstate.getOffsetX16();
+		vertex.screenpos.y = (int)(pos[1] * 16) + gstate.getOffsetY16();
 		vertex.screenpos.z = pos[2];
 		vertex.clippos.w = 1.f;
+		vertex.fogdepth = 1.f;
 	}
 
 	return vertex;
@@ -203,101 +248,10 @@ struct SplinePatch {
 	int pad[3];
 };
 
-SplinePatch *TransformUnit::patchBuffer_ = 0;
-int TransformUnit::patchBufferSize_ = 0;
-
-void TransformUnit::SubmitSpline(void* control_points, void* indices, int count_u, int count_v, int type_u, int type_v, GEPatchPrimType prim_type, u32 vertex_type)
+void TransformUnit::SubmitPrimitive(void* vertices, void* indices, GEPrimitiveType prim_type, int vertex_count, u32 vertex_type, int *bytesRead, SoftwareDrawEngine *drawEngine)
 {
-	VertexDecoder vdecoder;
-	VertexDecoderOptions options;
-	memset(&options, 0, sizeof(options));
-	options.expandAllUVtoFloat = false;
-	vdecoder.SetVertexType(vertex_type, options);
-	const DecVtxFormat& vtxfmt = vdecoder.GetDecVtxFmt();
-
-	static u8 buf[65536 * 48]; // yolo
-	u16 index_lower_bound = 0;
-	u16 index_upper_bound = count_u * count_v - 1;
-	bool indices_16bit = (vertex_type & GE_VTYPE_IDX_MASK) == GE_VTYPE_IDX_16BIT;
-	u8* indices8 = (u8*)indices;
-	u16* indices16 = (u16*)indices;
-	if (indices)
-		GetIndexBounds(indices, count_u*count_v, vertex_type, &index_lower_bound, &index_upper_bound);
-	vdecoder.DecodeVerts(buf, control_points, index_lower_bound, index_upper_bound);
-
-	VertexReader vreader(buf, vtxfmt, vertex_type);
-
-	int num_patches_u = count_u - 3;
-	int num_patches_v = count_v - 3;
-
-	if (patchBufferSize_ < num_patches_u * num_patches_v) {
-		if (patchBuffer_) {
-			FreeAlignedMemory(patchBuffer_);
-		}
-		patchBuffer_ = (SplinePatch *)AllocateAlignedMemory(num_patches_u * num_patches_v, 16);
-		patchBufferSize_ = num_patches_u * num_patches_v;
-	}
-	SplinePatch *patches = patchBuffer_;
-
-	for (int patch_u = 0; patch_u < num_patches_u; ++patch_u) {
-		for (int patch_v = 0; patch_v < num_patches_v; ++patch_v) {
-			SplinePatch& patch = patches[patch_u + patch_v * num_patches_u];
-
-			for (int point = 0; point < 16; ++point) {
-				int idx = (patch_u + point%4) + (patch_v + point/4) * count_u;
-				if (indices)
-					vreader.Goto(indices_16bit ? indices16[idx] : indices8[idx]);
-				else
-					vreader.Goto(idx);
-
-				patch.points[point] = ReadVertex(vreader);
-			}
-			patch.type = (type_u | (type_v<<2));
-			if (patch_u != 0) patch.type &= ~START_OPEN_U;
-			if (patch_v != 0) patch.type &= ~START_OPEN_V;
-			if (patch_u != num_patches_u-1) patch.type &= ~END_OPEN_U;
-			if (patch_v != num_patches_v-1) patch.type &= ~END_OPEN_V;
-		}
-	}
-
-	for (int patch_idx = 0; patch_idx < num_patches_u*num_patches_v; ++patch_idx) {
-		SplinePatch& patch = patches[patch_idx];
-
-		// TODO: Should do actual patch subdivision instead of just drawing the control points!
-		const int tile_min_u = (patch.type & START_OPEN_U) ? 0 : 1;
-		const int tile_min_v = (patch.type & START_OPEN_V) ? 0 : 1;
-		const int tile_max_u = (patch.type & END_OPEN_U) ? 3 : 2;
-		const int tile_max_v = (patch.type & END_OPEN_V) ? 3 : 2;
-		for (int tile_u = tile_min_u; tile_u < tile_max_u; ++tile_u) {
-			for (int tile_v = tile_min_v; tile_v < tile_max_v; ++tile_v) {
-				int point_index = tile_u + tile_v*4;
-
-				VertexData v0 = patch.points[point_index];
-				VertexData v1 = patch.points[point_index+1];
-				VertexData v2 = patch.points[point_index+4];
-				VertexData v3 = patch.points[point_index+5];
-
-				// TODO: Backface culling etc
-				Clipper::ProcessTriangle(v0, v1, v2);
-				Clipper::ProcessTriangle(v2, v1, v0);
-				Clipper::ProcessTriangle(v2, v1, v3);
-				Clipper::ProcessTriangle(v3, v1, v2);
-			}
-		}
-	}
-
-	host->GPUNotifyDraw();
-}
-
-void TransformUnit::SubmitPrimitive(void* vertices, void* indices, u32 prim_type, int vertex_count, u32 vertex_type, int *bytesRead)
-{
-	// TODO: Cache VertexDecoder objects
-	VertexDecoder vdecoder;
-	VertexDecoderOptions options;
-	memset(&options, 0, sizeof(options));
-	options.expandAllUVtoFloat = false;
-	vdecoder.SetVertexType(vertex_type, options);
-	const DecVtxFormat& vtxfmt = vdecoder.GetDecVtxFmt();
+	VertexDecoder &vdecoder = *drawEngine->FindVertexDecoder(vertex_type);
+	const DecVtxFormat &vtxfmt = vdecoder.GetDecVtxFmt();
 
 	if (bytesRead)
 		*bytesRead = vertex_count * vdecoder.VertexSize();
@@ -309,9 +263,8 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, u32 prim_type
 
 	u16 index_lower_bound = 0;
 	u16 index_upper_bound = vertex_count - 1;
-	bool indices_16bit = (vertex_type & GE_VTYPE_IDX_MASK) == GE_VTYPE_IDX_16BIT;
-	u8* indices8 = (u8*)indices;
-	u16* indices16 = (u16*)indices;
+	IndexConverter idxConv(vertex_type, indices);
+
 	if (indices)
 		GetIndexBounds(indices, vertex_count, vertex_type, &index_lower_bound, &index_upper_bound);
 	vdecoder.DecodeVerts(buf, vertices, index_lower_bound, index_upper_bound);
@@ -319,16 +272,26 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, u32 prim_type
 	VertexReader vreader(buf, vtxfmt, vertex_type);
 
 	const int max_vtcs_per_prim = 3;
-	int vtcs_per_prim = 0;
+	static VertexData data[max_vtcs_per_prim];
+	// This is the index of the next vert in data (or higher, may need modulus.)
+	static int data_index = 0;
 
+	static GEPrimitiveType prev_prim = GE_PRIM_POINTS;
+	if (prim_type != GE_PRIM_KEEP_PREVIOUS) {
+		data_index = 0;
+		prev_prim = prim_type;
+	} else {
+		prim_type = prev_prim;
+	}
+
+	int vtcs_per_prim;
 	switch (prim_type) {
 	case GE_PRIM_POINTS: vtcs_per_prim = 1; break;
 	case GE_PRIM_LINES: vtcs_per_prim = 2; break;
 	case GE_PRIM_TRIANGLES: vtcs_per_prim = 3; break;
 	case GE_PRIM_RECTANGLES: vtcs_per_prim = 2; break;
+	default: vtcs_per_prim = 0; break;
 	}
-
-	VertexData data[max_vtcs_per_prim];
 
 	// TODO: Do this in two passes - first process the vertices (before indexing/stripping),
 	// then resolve the indices. This lets us avoid transforming shared vertices twice.
@@ -339,18 +302,23 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, u32 prim_type
 	case GE_PRIM_TRIANGLES:
 	case GE_PRIM_RECTANGLES:
 		{
-			for (int vtx = 0; vtx < vertex_count; vtx += vtcs_per_prim) {
-				for (int i = 0; i < vtcs_per_prim; ++i) {
-					if (indices)
-						vreader.Goto(indices_16bit ? indices16[vtx+i] : indices8[vtx+i]);
-					else
-						vreader.Goto(vtx+i);
-
-					data[i] = ReadVertex(vreader);
-					if (outside_range_flag)
-						break;
+			for (int vtx = 0; vtx < vertex_count; ++vtx) {
+				if (indices) {
+					vreader.Goto(idxConv.convert(vtx) - index_lower_bound);
+				} else {
+					vreader.Goto(vtx);
 				}
+
+				data[data_index++] = ReadVertex(vreader);
+				if (data_index < vtcs_per_prim) {
+					// Keep reading.  Note: an incomplete prim will stay read for GE_PRIM_KEEP_PREVIOUS.
+					continue;
+				}
+
+				// Okay, we've got enough verts.  Reset the index for next time.
+				data_index = 0;
 				if (outside_range_flag) {
+					// Cull the prim if it was outside, and move to the next prim.
 					outside_range_flag = false;
 					continue;
 				}
@@ -361,10 +329,11 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, u32 prim_type
 					if (!gstate.isCullEnabled() || gstate.isModeClear()) {
 						Clipper::ProcessTriangle(data[0], data[1], data[2]);
 						Clipper::ProcessTriangle(data[2], data[1], data[0]);
-					} else if (!gstate.getCullMode())
+					} else if (!gstate.getCullMode()) {
 						Clipper::ProcessTriangle(data[2], data[1], data[0]);
-					else
+					} else {
 						Clipper::ProcessTriangle(data[0], data[1], data[2]);
+					}
 					break;
 				}
 
@@ -379,6 +348,9 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, u32 prim_type
 				case GE_PRIM_POINTS:
 					Clipper::ProcessPoint(data[0]);
 					break;
+
+				default:
+					_dbg_assert_msg_(G3D, false, "Unexpected prim type: %d", prim_type);
 				}
 			}
 			break;
@@ -386,14 +358,17 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, u32 prim_type
 
 	case GE_PRIM_LINE_STRIP:
 		{
-			int skip_count = 1; // Don't draw a line when loading the first vertex
+			// Don't draw a line when loading the first vertex.
+			// If data_index is 1 or 2, etc., it means we're continuing a line strip.
+			int skip_count = data_index == 0 ? 1 : 0;
 			for (int vtx = 0; vtx < vertex_count; ++vtx) {
-				if (indices)
-					vreader.Goto(indices_16bit ? indices16[vtx] : indices8[vtx]);
-				else
+				if (indices) {
+					vreader.Goto(idxConv.convert(vtx) - index_lower_bound);
+				} else {
 					vreader.Goto(vtx);
+				}
 
-				data[vtx & 1] = ReadVertex(vreader);
+				data[(data_index++) & 1] = ReadVertex(vreader);
 				if (outside_range_flag) {
 					// Drop all primitives containing the current vertex
 					skip_count = 2;
@@ -404,7 +379,8 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, u32 prim_type
 				if (skip_count) {
 					--skip_count;
 				} else {
-					Clipper::ProcessLine(data[(vtx & 1) ^ 1], data[vtx & 1]);
+					// We already incremented data_index, so data_index & 1 is previous one.
+					Clipper::ProcessLine(data[data_index & 1], data[(data_index & 1) ^ 1]);
 				}
 			}
 			break;
@@ -412,15 +388,17 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, u32 prim_type
 
 	case GE_PRIM_TRIANGLE_STRIP:
 		{
-			int skip_count = 2; // Don't draw a triangle when loading the first two vertices
+			// Don't draw a triangle when loading the first two vertices.
+			int skip_count = data_index >= 2 ? 0 : 2 - data_index;
 
 			for (int vtx = 0; vtx < vertex_count; ++vtx) {
-				if (indices)
-					vreader.Goto(indices_16bit ? indices16[vtx] : indices8[vtx]);
-				else
+				if (indices) {
+					vreader.Goto(idxConv.convert(vtx) - index_lower_bound);
+				} else {
 					vreader.Goto(vtx);
+				}
 
-				data[vtx % 3] = ReadVertex(vreader);
+				data[(data_index++) % 3] = ReadVertex(vreader);
 				if (outside_range_flag) {
 					// Drop all primitives containing the current vertex
 					skip_count = 2;
@@ -436,7 +414,7 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, u32 prim_type
 				if (!gstate.isCullEnabled() || gstate.isModeClear()) {
 					Clipper::ProcessTriangle(data[0], data[1], data[2]);
 					Clipper::ProcessTriangle(data[2], data[1], data[0]);
-				} else if ((!gstate.getCullMode()) ^ (vtx % 2)) {
+				} else if ((!gstate.getCullMode()) ^ ((data_index - 1) % 2)) {
 					// We need to reverse the vertex order for each second primitive,
 					// but we additionally need to do that for every primitive if CCW cullmode is used.
 					Clipper::ProcessTriangle(data[2], data[1], data[0]);
@@ -449,21 +427,31 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, u32 prim_type
 
 	case GE_PRIM_TRIANGLE_FAN:
 		{
-			unsigned int skip_count = 1; // Don't draw a triangle when loading the first two vertices
+			// Don't draw a triangle when loading the first two vertices.
+			// (this doesn't count the central one.)
+			int skip_count = data_index <= 1 ? 1 : 0;
+			int start_vtx = 0;
 
-			if (indices)
-				vreader.Goto(indices_16bit ? indices16[0] : indices8[0]);
-			else
-				vreader.Goto(0);
-			data[0] = ReadVertex(vreader);
+			// Only read the central vertex if we're not continuing.
+			if (data_index == 0) {
+				if (indices) {
+					vreader.Goto(idxConv.convert(0) - index_lower_bound);
+				} else {
+					vreader.Goto(0);
+				}
+				data[0] = ReadVertex(vreader);
+				data_index++;
+				start_vtx = 1;
+			}
 
-			for (int vtx = 1; vtx < vertex_count; ++vtx) {
-				if (indices)
-					vreader.Goto(indices_16bit ? indices16[vtx] : indices8[vtx]);
-				else
+			for (int vtx = start_vtx; vtx < vertex_count; ++vtx) {
+				if (indices) {
+					vreader.Goto(idxConv.convert(vtx) - index_lower_bound);
+				} else {
 					vreader.Goto(vtx);
+				}
 
-				data[2 - (vtx % 2)] = ReadVertex(vreader);
+				data[2 - ((data_index++) % 2)] = ReadVertex(vreader);
 				if (outside_range_flag) {
 					// Drop all primitives containing the current vertex
 					skip_count = 2;
@@ -479,7 +467,7 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, u32 prim_type
 				if (!gstate.isCullEnabled() || gstate.isModeClear()) {
 					Clipper::ProcessTriangle(data[0], data[1], data[2]);
 					Clipper::ProcessTriangle(data[2], data[1], data[0]);
-				} else if ((!gstate.getCullMode()) ^ (vtx % 2)) {
+				} else if ((!gstate.getCullMode()) ^ ((data_index - 1) % 2)) {
 					// We need to reverse the vertex order for each second primitive,
 					// but we additionally need to do that for every primitive if CCW cullmode is used.
 					Clipper::ProcessTriangle(data[2], data[1], data[0]);
@@ -489,12 +477,17 @@ void TransformUnit::SubmitPrimitive(void* vertices, void* indices, u32 prim_type
 			}
 			break;
 		}
+
+	default:
+		ERROR_LOG(G3D, "Unexpected prim type: %d", prim_type);
+		break;
 	}
 
 	host->GPUNotifyDraw();
 }
 
 // TODO: This probably is not the best interface.
+// Also, we should try to merge this into the similar function in DrawEngineCommon.
 bool TransformUnit::GetCurrentSimpleVertices(int count, std::vector<GPUDebugVertex> &vertices, std::vector<u16> &indices) {
 	// This is always for the current vertices.
 	u16 indexLowerBound = 0;
@@ -503,23 +496,32 @@ bool TransformUnit::GetCurrentSimpleVertices(int count, std::vector<GPUDebugVert
 	if ((gstate.vertType & GE_VTYPE_IDX_MASK) != GE_VTYPE_IDX_NONE) {
 		const u8 *inds = Memory::GetPointer(gstate_c.indexAddr);
 		const u16 *inds16 = (const u16 *)inds;
+		const u32 *inds32 = (const u32 *)inds;
 
 		if (inds) {
 			GetIndexBounds(inds, count, gstate.vertType, &indexLowerBound, &indexUpperBound);
 			indices.resize(count);
 			switch (gstate.vertType & GE_VTYPE_IDX_MASK) {
-			case GE_VTYPE_IDX_16BIT:
-				for (int i = 0; i < count; ++i) {
-					indices[i] = inds16[i];
-				}
-				break;
 			case GE_VTYPE_IDX_8BIT:
 				for (int i = 0; i < count; ++i) {
 					indices[i] = inds[i];
 				}
 				break;
-			default:
-				return false;
+			case GE_VTYPE_IDX_16BIT:
+				for (int i = 0; i < count; ++i) {
+					indices[i] = inds16[i];
+				}
+				break;
+			case GE_VTYPE_IDX_32BIT:
+				WARN_LOG_REPORT_ONCE(simpleIndexes32, G3D, "SimpleVertices: Decoding 32-bit indexes");
+				for (int i = 0; i < count; ++i) {
+					// These aren't documented and should be rare.  Let's bounds check each one.
+					if (inds32[i] != (u16)inds32[i]) {
+						ERROR_LOG_REPORT_ONCE(simpleIndexes32Bounds, G3D, "SimpleVertices: Index outside 16-bit range");
+					}
+					indices[i] = (u16)inds32[i];
+				}
+				break;
 			}
 		} else {
 			indices.clear();
@@ -534,9 +536,7 @@ bool TransformUnit::GetCurrentSimpleVertices(int count, std::vector<GPUDebugVert
 	simpleVertices.resize(indexUpperBound + 1);
 
 	VertexDecoder vdecoder;
-	VertexDecoderOptions options;
-	memset(&options, 0, sizeof(options));
-	options.expandAllUVtoFloat = false;  // TODO: True should be fine here
+	VertexDecoderOptions options{};
 	vdecoder.SetVertexType(gstate.vertType, options);
 	DrawEngineCommon::NormalizeVertices((u8 *)(&simpleVertices[0]), (u8 *)(&temp_buffer[0]), Memory::GetPointer(gstate_c.vertexAddr), &vdecoder, indexLowerBound, indexUpperBound, gstate.vertType);
 
@@ -576,15 +576,15 @@ bool TransformUnit::GetCurrentSimpleVertices(int count, std::vector<GPUDebugVert
 			DrawingCoords drawPos = ScreenToDrawing(screenPos);
 
 			if (gstate.vertType & GE_VTYPE_TC_MASK) {
-				vertices[i].u = vert.uv[0];
-				vertices[i].v = vert.uv[1];
+				vertices[i].u = vert.uv[0] * (float)gstate.getTextureWidth(0);
+				vertices[i].v = vert.uv[1] * (float)gstate.getTextureHeight(0);
 			} else {
 				vertices[i].u = 0.0f;
 				vertices[i].v = 0.0f;
 			}
 			vertices[i].x = drawPos.x;
 			vertices[i].y = drawPos.y;
-			vertices[i].z = 1.0;
+			vertices[i].z = drawPos.z;
 			if (gstate.vertType & GE_VTYPE_COL_MASK) {
 				memcpy(vertices[i].c, vert.color, sizeof(vertices[i].c));
 			} else {
@@ -592,6 +592,10 @@ bool TransformUnit::GetCurrentSimpleVertices(int count, std::vector<GPUDebugVert
 			}
 		}
 	}
+
+	// The GE debugger expects these to be set.
+	gstate_c.curTextureWidth = gstate.getTextureWidth(0);
+	gstate_c.curTextureHeight = gstate.getTextureHeight(0);
 
 	return true;
 }

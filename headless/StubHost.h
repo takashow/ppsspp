@@ -17,25 +17,25 @@
 
 #pragma once
 
+#include "Core/CoreParameter.h"
 #include "Core/Host.h"
 #include "Core/Debugger/SymbolMap.h"
 
 // TODO: Get rid of this junk
-class HeadlessHost : public Host
-{
+class HeadlessHost : public Host {
 public:
-	// void StartThread() override
 	void UpdateUI() override {}
 
 	void UpdateMemView() override {}
 	void UpdateDisassembly() override {}
 
-	void SetDebugMode(bool mode) { }
+	void SetDebugMode(bool mode) override { }
 
-	bool InitGraphics(std::string *error_message) override {return false;}
+	void SetGraphicsCore(GPUCore core) { gpuCore_ = core; }
+	bool InitGraphics(std::string *error_message, GraphicsContext **ctx) override {return false;}
 	void ShutdownGraphics() override {}
 
-	void InitSound(PMixer *mixer) override {}
+	void InitSound() override {}
 	void UpdateSound() override {}
 	void ShutdownSound() override {}
 
@@ -43,7 +43,7 @@ public:
 	void BootDone() override {}
 
 	bool IsDebuggingEnabled() override { return false; }
-	bool AttemptLoadSymbolMap() override { symbolMap.Clear(); return false; }
+	bool AttemptLoadSymbolMap() override { g_symbolMap->Clear(); return false; }
 
 	bool ShouldSkipUI() override { return true; }
 
@@ -64,12 +64,21 @@ public:
 			debugOutputBuffer_.clear();
 		}
 	}
-	virtual void SetComparisonScreenshot(const std::string &filename) {}
 
+	virtual void SetComparisonScreenshot(const std::string &filename) {
+		comparisonScreenshot_ = filename;
+	}
+
+	void SendDebugScreenshot(const u8 *pixbuf, u32 w, u32 h) override;
 
 	// Unique for HeadlessHost
 	virtual void SwapBuffers() {}
 
 protected:
+	void SendOrCollectDebugOutput(const std::string &output);
+
+	std::string comparisonScreenshot_;
 	std::string debugOutputBuffer_;
+	GPUCore gpuCore_;
+	GraphicsContext *gfx_ = nullptr;
 };

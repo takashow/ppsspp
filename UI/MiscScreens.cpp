@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2013- PPSSPP Project.
+// Copyright (c) 2013- PPSSPP Project.
 
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
@@ -15,10 +15,13 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
-#include <algorithm>
+#include "ppsspp_config.h"
 
-#include "base/functional.h"
+#include <algorithm>
+#include <functional>
+
 #include "base/colorutil.h"
+#include "base/display.h"
 #include "base/timeutil.h"
 #include "gfx_es2/draw_buffer.h"
 #include "math/curves.h"
@@ -27,33 +30,30 @@
 #include "ui/view.h"
 #include "ui/viewgroup.h"
 #include "ui/ui.h"
+#include "util/random/rng.h"
 #include "file/vfs.h"
-#include "UI/MiscScreens.h"
+#include "UI/ui_atlas.h"
+#include "UI/ControlMappingScreen.h"
+#include "UI/DisplayLayoutScreen.h"
 #include "UI/EmuScreen.h"
-#include "UI/MainScreen.h"
 #include "UI/GameInfoCache.h"
+#include "UI/GameSettingsScreen.h"
+#include "UI/MainScreen.h"
+#include "UI/MiscScreens.h"
 #include "Core/Config.h"
 #include "Core/Host.h"
 #include "Core/System.h"
 #include "Core/MIPS/JitCommon/JitCommon.h"
 #include "Core/HLE/sceUtility.h"
-#include "Common/CPUDetect.h"
 #include "Common/FileUtil.h"
 #include "GPU/GPUState.h"
+#include "GPU/Common/PostShader.h"
 
 #include "ui_atlas.h"
 
 #ifdef _MSC_VER
 #pragma execution_character_set("utf-8")
 #endif
-
-#include "base/timeutil.h"
-#include "base/colorutil.h"
-#include "gfx_es2/draw_buffer.h"
-#include "gfx_es2/gl_state.h"
-#include "util/random/rng.h"
-
-#include "UI/ui_atlas.h"
 
 static const int symbols[4] = {
 	I_CROSS,
@@ -69,7 +69,22 @@ static const uint32_t colors[4] = {
 	0xC0FFFFFF,
 };
 
-void DrawBackground(UIContext &dc, float alpha = 1.0f) {
+static std::unique_ptr<ManagedTexture> bgTexture;
+
+void UIBackgroundInit(UIContext &dc) {
+	const std::string bgPng = GetSysDirectory(DIRECTORY_SYSTEM) + "background.png";
+	const std::string bgJpg = GetSysDirectory(DIRECTORY_SYSTEM) + "background.jpg";
+	if (File::Exists(bgPng) || File::Exists(bgJpg)) {
+		const std::string &bgFile = File::Exists(bgPng) ? bgPng : bgJpg;
+		bgTexture = CreateTextureFromFile(dc.GetDrawContext(), bgFile.c_str(), DETECT, true);
+	}
+}
+
+void UIBackgroundShutdown() {
+	bgTexture.reset(nullptr);
+}
+
+void DrawBackground(UIContext &dc, float alpha) {
 	static float xbase[100] = {0};
 	static float ybase[100] = {0};
 	float xres = dc.GetBounds().w;
@@ -87,12 +102,20 @@ void DrawBackground(UIContext &dc, float alpha = 1.0f) {
 		last_yres = yres;
 	}
 	
-	dc.GetThin3DContext()->Clear(T3DClear::COLOR | T3DClear::DEPTH | T3DClear::STENCIL, 0xff224477, 0.0, 0);
-	int img = I_BG;
-#ifdef GOLD
-	img = I_BG_GOLD;
-#endif
-	ui_draw2d.DrawImageStretch(img, dc.GetBounds());
+	uint32_t bgColor = whiteAlpha(alpha);
+
+	if (bgTexture != nullptr) {
+		dc.Flush();
+		dc.GetDrawContext()->BindTexture(0, bgTexture->GetTexture());
+		dc.Draw()->DrawTexRect(dc.GetBounds(), 0, 0, 1, 1, bgColor);
+
+		dc.Flush();
+		dc.RebindTexture();
+	} else {
+		ImageID img = I_BG;
+		ui_draw2d.DrawImageStretch(img, dc.GetBounds(), bgColor);
+	}
+
 	float t = time_now();
 	for (int i = 0; i < 100; i++) {
 		float x = xbase[i] + dc.GetBounds().x;
@@ -104,41 +127,69 @@ void DrawBackground(UIContext &dc, float alpha = 1.0f) {
 }
 
 void DrawGameBackground(UIContext &dc, const std::string &gamePath) {
-	GameInfo *ginfo = g_gameInfoCache.GetInfo(dc.GetThin3DContext(), gamePath, GAMEINFO_WANTBG);
+	std::shared_ptr<GameInfo> ginfo;
+	if (gamePath.size())
+		ginfo = g_gameInfoCache->GetInfo(dc.GetDrawContext(), gamePath, GAMEINFO_WANTBG);
 	dc.Flush();
 
-	if (ginfo) {
-		bool hasPic = false;
-		double loadTime;
-		if (ginfo->pic1Texture) {
-			dc.GetThin3DContext()->SetTexture(0, ginfo->pic1Texture);
-			loadTime = ginfo->timePic1WasLoaded;
-			hasPic = true;
-		} else if (ginfo->pic0Texture) {
-			dc.GetThin3DContext()->SetTexture(0, ginfo->pic0Texture);
-			loadTime = ginfo->timePic0WasLoaded;
-			hasPic = true;
-		}
-		if (hasPic) {
-			uint32_t color = whiteAlpha(ease((time_now_d() - loadTime) * 3)) & 0xFFc0c0c0;
-			dc.Draw()->DrawTexRect(dc.GetBounds(), 0,0,1,1, color);
-			dc.Flush();
-			dc.RebindTexture();
-		} else {
-			::DrawBackground(dc, 1.0f);
-			dc.RebindTexture();
-			dc.Flush();
-		}
+	bool hasPic = false;
+	double loadTime;
+	if (ginfo && ginfo->pic1.texture) {
+		dc.GetDrawContext()->BindTexture(0, ginfo->pic1.texture->GetTexture());
+		loadTime = ginfo->pic1.timeLoaded;
+		hasPic = true;
+	} else if (ginfo && ginfo->pic0.texture) {
+		dc.GetDrawContext()->BindTexture(0, ginfo->pic0.texture->GetTexture());
+		loadTime = ginfo->pic0.timeLoaded;
+		hasPic = true;
+	}
+	if (hasPic) {
+		uint32_t color = whiteAlpha(ease((time_now_d() - loadTime) * 3)) & 0xFFc0c0c0;
+		dc.Draw()->DrawTexRect(dc.GetBounds(), 0,0,1,1, color);
+		dc.Flush();
+		dc.RebindTexture();
+	} else {
+		::DrawBackground(dc, 1.0f);
+		dc.RebindTexture();
+		dc.Flush();
 	}
 }
 
-void HandleCommonMessages(const char *message, const char *value, ScreenManager *manager) {
+void HandleCommonMessages(const char *message, const char *value, ScreenManager *manager, Screen *activeScreen) {
+	bool isActiveScreen = manager->topScreen() == activeScreen;
+
 	if (!strcmp(message, "clear jit")) {
 		if (MIPSComp::jit && PSP_IsInited()) {
 			MIPSComp::jit->ClearCache();
 		}
 		if (PSP_IsInited()) {
-			currentMIPS->UpdateCore(g_Config.bJit ? CPU_JIT : CPU_INTERPRETER);
+			currentMIPS->UpdateCore((CPUCore)g_Config.iCpuCore);
+		}
+	} else if (!strcmp(message, "control mapping") && isActiveScreen && activeScreen->tag() != "control mapping") {
+		UpdateUIState(UISTATE_MENU);
+		manager->push(new ControlMappingScreen());
+	} else if (!strcmp(message, "display layout editor") && isActiveScreen && activeScreen->tag() != "display layout screen") {
+		UpdateUIState(UISTATE_MENU);
+		manager->push(new DisplayLayoutScreen());
+	} else if (!strcmp(message, "settings") && isActiveScreen && activeScreen->tag() != "settings") {
+		UpdateUIState(UISTATE_MENU);
+		manager->push(new GameSettingsScreen(""));
+	} else if (!strcmp(message, "language screen") && isActiveScreen) {
+		I18NCategory *dev = GetI18NCategory("Developer");
+		auto langScreen = new NewLanguageScreen(dev->T("Language"));
+		langScreen->OnChoice.Add([](UI::EventParams &) {
+			NativeMessageReceived("recreateviews", "");
+			if (host) {
+				host->UpdateUI();
+			}
+			return UI::EVENT_DONE;
+		});
+		manager->push(langScreen);
+	} else if (!strcmp(message, "window minimized")) {
+		if (!strcmp(value, "true")) {
+			gstate_c.skipDrawReason |= SKIPDRAW_WINDOW_MINIMIZED;
+		} else {
+			gstate_c.skipDrawReason &= ~SKIPDRAW_WINDOW_MINIMIZED;
 		}
 	}
 }
@@ -149,67 +200,58 @@ void UIScreenWithBackground::DrawBackground(UIContext &dc) {
 }
 
 void UIScreenWithGameBackground::DrawBackground(UIContext &dc) {
-	DrawGameBackground(dc, gamePath_);
+	if (!gamePath_.empty()) {
+		DrawGameBackground(dc, gamePath_);
+	} else {
+		::DrawBackground(dc, 1.0f);
+		dc.Flush();
+	}
+}
+
+void UIScreenWithGameBackground::sendMessage(const char *message, const char *value) {
+	if (!strcmp(message, "settings") && screenManager()->topScreen() == this) {
+		screenManager()->push(new GameSettingsScreen(gamePath_));
+	} else {
+		UIScreenWithBackground::sendMessage(message, value);
+	}
 }
 
 void UIDialogScreenWithGameBackground::DrawBackground(UIContext &dc) {
 	DrawGameBackground(dc, gamePath_);
 }
 
+void UIDialogScreenWithGameBackground::sendMessage(const char *message, const char *value) {
+	if (!strcmp(message, "settings") && screenManager()->topScreen() == this) {
+		screenManager()->push(new GameSettingsScreen(gamePath_));
+	} else {
+		UIDialogScreenWithBackground::sendMessage(message, value);
+	}
+}
+
 void UIScreenWithBackground::sendMessage(const char *message, const char *value) {
-	HandleCommonMessages(message, value, screenManager());
-	I18NCategory *de = GetI18NCategory("Developer");
-	if (!strcmp(message, "language screen")) {
-		auto langScreen = new NewLanguageScreen(de->T("Language"));
-		langScreen->OnChoice.Handle(this, &UIScreenWithBackground::OnLanguageChange);
-		screenManager()->push(langScreen);
-	}
-}
-
-UI::EventReturn UIScreenWithBackground::OnLanguageChange(UI::EventParams &e) {
-	screenManager()->RecreateAllViews();
-	if (host) {
-		host->UpdateUI();
-	}
-
-	return UI::EVENT_DONE;
-}
-
-UI::EventReturn UIDialogScreenWithBackground::OnLanguageChange(UI::EventParams &e) {
-	screenManager()->RecreateAllViews();
-	if (host) {
-		host->UpdateUI();
-	}
-
-	return UI::EVENT_DONE;
+	HandleCommonMessages(message, value, screenManager(), this);
 }
 
 void UIDialogScreenWithBackground::DrawBackground(UIContext &dc) {
-	::DrawBackground(dc);
+	::DrawBackground(dc, 1.0f);
 	dc.Flush();
 }
 
+void UIDialogScreenWithBackground::AddStandardBack(UI::ViewGroup *parent) {
+	using namespace UI;
+	I18NCategory *di = GetI18NCategory("Dialog");
+	parent->Add(new Choice(di->T("Back"), "", false, new AnchorLayoutParams(150, 64, 10, NONE, NONE, 10)))->OnClick.Handle<UIScreen>(this, &UIScreen::OnBack);
+}
+
 void UIDialogScreenWithBackground::sendMessage(const char *message, const char *value) {
-	HandleCommonMessages(message, value, screenManager());
-	I18NCategory *de = GetI18NCategory("Developer");
-	if (!strcmp(message, "language screen")) {
-		auto langScreen = new NewLanguageScreen(de->T("Language"));
-		langScreen->OnChoice.Handle(this, &UIDialogScreenWithBackground::OnLanguageChange);
-		screenManager()->push(langScreen);
-	} else if (!strcmp(message, "window minimized")) {
-		if (!strcmp(value, "true")) {
-			gstate_c.skipDrawReason |= SKIPDRAW_WINDOW_MINIMIZED;
-		} else {
-			gstate_c.skipDrawReason &= ~SKIPDRAW_WINDOW_MINIMIZED;
-		}
-	}
+	HandleCommonMessages(message, value, screenManager(), this);
 }
 
 PromptScreen::PromptScreen(std::string message, std::string yesButtonText, std::string noButtonText, std::function<void(bool)> callback)
-	: message_(message), callback_(callback) {
-		I18NCategory *d = GetI18NCategory("Dialog");
-		yesButtonText_ = d->T(yesButtonText.c_str());
-		noButtonText_ = d->T(noButtonText.c_str());
+		: message_(message), callback_(callback) {
+	I18NCategory *di = GetI18NCategory("Dialog");
+	yesButtonText_ = di->T(yesButtonText.c_str());
+	noButtonText_ = di->T(noButtonText.c_str());
 }
 
 void PromptScreen::CreateViews() {
@@ -225,38 +267,43 @@ void PromptScreen::CreateViews() {
 	ViewGroup *leftColumn = new AnchorLayout(new LinearLayoutParams(1.0f));
 	root_->Add(leftColumn);
 
-	leftColumn->Add(new TextView(message_, ALIGN_LEFT, false, new AnchorLayoutParams(10, 10, NONE, NONE)));
+	float leftColumnWidth = dp_xres - actionMenuMargins.left - actionMenuMargins.right - 300.0f;
+	leftColumn->Add(new TextView(message_, ALIGN_LEFT | FLAG_WRAP_TEXT, false, new AnchorLayoutParams(leftColumnWidth, WRAP_CONTENT, 10, 10, NONE, NONE)))->SetClip(false);
 
 	ViewGroup *rightColumnItems = new LinearLayout(ORIENT_VERTICAL, new LinearLayoutParams(300, FILL_PARENT, actionMenuMargins));
 	root_->Add(rightColumnItems);
 	Choice *yesButton = rightColumnItems->Add(new Choice(yesButtonText_));
 	yesButton->OnClick.Handle(this, &PromptScreen::OnYes);
 	root_->SetDefaultFocusView(yesButton);
-	if (noButtonText_ != "")
+	if (!noButtonText_.empty())
 		rightColumnItems->Add(new Choice(noButtonText_))->OnClick.Handle(this, &PromptScreen::OnNo);
 }
 
 UI::EventReturn PromptScreen::OnYes(UI::EventParams &e) {
-	callback_(true);
-	screenManager()->finishDialog(this, DR_OK);
+	TriggerFinish(DR_OK);
 	return UI::EVENT_DONE;
 }
 
 UI::EventReturn PromptScreen::OnNo(UI::EventParams &e) {
-	callback_(false);
-	screenManager()->finishDialog(this, DR_CANCEL);
+	TriggerFinish(DR_CANCEL);
 	return UI::EVENT_DONE;
+}
+
+void PromptScreen::TriggerFinish(DialogResult result) {
+	callback_(result == DR_OK || result == DR_YES);
+	UIDialogScreenWithBackground::TriggerFinish(result);
 }
 
 PostProcScreen::PostProcScreen(const std::string &title) : ListPopupScreen(title) {
 	I18NCategory *ps = GetI18NCategory("PostShaders");
+	ReloadAllPostShaderInfo();
 	shaders_ = GetAllPostShaderInfo();
 	std::vector<std::string> items;
 	int selected = -1;
 	for (int i = 0; i < (int)shaders_.size(); i++) {
 		if (shaders_[i].section == g_Config.sPostShaderName)
 			selected = i;
-		items.push_back(ps->T(shaders_[i].name.c_str()));
+		items.push_back(ps->T(shaders_[i].section.c_str()));
 	}
 	adaptor_ = UI::StringVectorListAdaptor(items, selected);
 }
@@ -285,12 +332,18 @@ NewLanguageScreen::NewLanguageScreen(const std::string &title) : ListPopupScreen
 			continue;
 		}
 
-#ifndef _WIN32
-		// ar_AE only works on Windows.
+		// We only support Arabic on platforms where we have support for the native text rendering
+		// APIs, as proper Arabic support is way too difficult to implement ourselves.
+#if !(defined(USING_QT_UI) || PPSSPP_PLATFORM(WINDOWS) || PPSSPP_PLATFORM(ANDROID))
 		if (tempLangs[i].name.find("ar_AE") != std::string::npos) {
 			continue;
 		}
+
+		if (tempLangs[i].name.find("fa_IR") != std::string::npos) {
+			continue;
+		}
 #endif
+
 		FileInfo lang = tempLangs[i];
 		langs_.push_back(lang);
 
@@ -337,7 +390,7 @@ void NewLanguageScreen::OnCompleted(DialogResult result) {
 	bool iniLoadedSuccessfully = false;
 	// Allow the lang directory to be overridden for testing purposes (e.g. Android, where it's hard to 
 	// test new languages without recompiling the entire app, which is a hassle).
-	const std::string langOverridePath = g_Config.memCardDirectory + "PSP/SYSTEM/lang/";
+	const std::string langOverridePath = g_Config.memStickDirectory + "PSP/SYSTEM/lang/";
 
 	// If we run into the unlikely case that "lang" is actually a file, just use the built-in translations.
 	if (!File::Exists(langOverridePath) || !File::IsDirectory(langOverridePath))
@@ -370,16 +423,18 @@ void LogoScreen::Next() {
 	}
 }
 
-void LogoScreen::update(InputState &input_state) {
-	UIScreen::update(input_state);
+const float logoScreenSeconds = 2.5f;
+
+void LogoScreen::update() {
+	UIScreen::update();
 	frames_++;
-	if (frames_ > 180 || input_state.pointer_down[0]) {
+	if (frames_ > 60 * logoScreenSeconds) {
 		Next();
 	}
 }
 
 void LogoScreen::sendMessage(const char *message, const char *value) {
-	if (!strcmp(message, "boot")) {
+	if (!strcmp(message, "boot") && screenManager()->topScreen() == this) {
 		screenManager()->switchScreen(new EmuScreen(value));
 	}
 }
@@ -392,7 +447,17 @@ bool LogoScreen::key(const KeyInput &key) {
 	return false;
 }
 
+bool LogoScreen::touch(const TouchInput &touch) {
+	if (touch.flags & TOUCH_DOWN) {
+		Next();
+		return true;
+	}
+	return false;
+}
+
 void LogoScreen::render() {
+	using namespace Draw;
+
 	UIScreen::render();
 	UIContext &dc = *screenManager()->getUIContext();
 
@@ -402,7 +467,7 @@ void LogoScreen::render() {
 	float yres = dc.GetBounds().h;
 
 	dc.Begin();
-	float t = (float)frames_ / 60.0f;
+	float t = (float)frames_ / (60.0f * logoScreenSeconds / 3.0f);
 
 	float alpha = t;
 	if (t > 1.0f)
@@ -410,30 +475,34 @@ void LogoScreen::render() {
 	float alphaText = alpha;
 	if (t > 2.0f)
 		alphaText = 3.0f - t;
+	uint32_t textColor = colorAlpha(dc.theme->infoStyle.fgColor, alphaText);
 
 	::DrawBackground(dc, alpha);
 
-	I18NCategory *c = GetI18NCategory("PSPCredits");
+	I18NCategory *cr = GetI18NCategory("PSPCredits");
+	I18NCategory *gr = GetI18NCategory("Graphics");
 	char temp[256];
-	snprintf(temp, sizeof(temp), "%s Henrik Rydg\xc3\xa5rd", c->T("created", "Created by"));
-#ifdef GOLD
-	dc.Draw()->DrawImage(I_ICONGOLD, bounds.centerX() - 120, bounds.centerY() - 30, 1.2f, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
-#else
-	dc.Draw()->DrawImage(I_ICON, bounds.centerX() - 120, bounds.centerY() - 30, 1.2f, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
-#endif
-	dc.Draw()->DrawImage(I_LOGO, bounds.centerX() + 40, bounds.centerY() - 30, 1.5f, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
-	//dc.Draw()->DrawTextShadow(UBUNTU48, "PPSSPP", xres / 2, yres / 2 - 30, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
-	dc.Draw()->SetFontScale(1.0f, 1.0f);
-	dc.SetFontStyle(dc.theme->uiFont);
-	dc.DrawText(temp, bounds.centerX(), bounds.centerY() + 40, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
-	dc.DrawText(c->T("license", "Free Software under GPL 2.0"), bounds.centerX(), bounds.centerY() + 70, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
-	dc.DrawText("www.ppsspp.org", bounds.centerX(), yres / 2 + 130, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
-	if (boot_filename.size()) {
-		ui_draw2d.DrawTextShadow(UBUNTU24, boot_filename.c_str(), bounds.centerX(), bounds.centerY() + 180, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
+	// Manually formatting UTF-8 is fun.  \xXX doesn't work everywhere.
+	snprintf(temp, sizeof(temp), "%s Henrik Rydg%c%crd", cr->T("created", "Created by"), 0xC3, 0xA5);
+	if (System_GetPropertyBool(SYSPROP_APP_GOLD)) {
+		dc.Draw()->DrawImage(I_ICONGOLD, bounds.centerX() - 120, bounds.centerY() - 30, 1.2f, textColor, ALIGN_CENTER);
+	} else {
+		dc.Draw()->DrawImage(I_ICON, bounds.centerX() - 120, bounds.centerY() - 30, 1.2f, textColor, ALIGN_CENTER);
 	}
+	dc.Draw()->DrawImage(I_LOGO, bounds.centerX() + 40, bounds.centerY() - 30, 1.5f, textColor, ALIGN_CENTER);
+	//dc.Draw()->DrawTextShadow(UBUNTU48, "PPSSPP", xres / 2, yres / 2 - 30, textColor, ALIGN_CENTER);
+	dc.SetFontScale(1.0f, 1.0f);
+	dc.SetFontStyle(dc.theme->uiFont);
+	dc.DrawText(temp, bounds.centerX(), bounds.centerY() + 40, textColor, ALIGN_CENTER);
+	dc.DrawText(cr->T("license", "Free Software under GPL 2.0+"), bounds.centerX(), bounds.centerY() + 70, textColor, ALIGN_CENTER);
 
-#ifdef _WIN32
-	dc.DrawText(screenManager()->getThin3DContext()->GetInfoString(T3DInfo::APINAME), bounds.centerX(), bounds.y2() - 100, colorAlpha(0xFFFFFFFF, alphaText), ALIGN_CENTER);
+	int ppsspp_org_y = yres / 2 + 130;
+	dc.DrawText("www.ppsspp.org", bounds.centerX(), ppsspp_org_y, textColor, ALIGN_CENTER);
+
+#if (defined(_WIN32) && !PPSSPP_PLATFORM(UWP)) || PPSSPP_PLATFORM(ANDROID)
+	// Draw the graphics API, except on UWP where it's always D3D11
+	std::string apiName = screenManager()->getDrawContext()->GetInfoString(InfoField::APINAME);
+	dc.DrawText(gr->T(apiName), bounds.centerX(), ppsspp_org_y + 50, textColor, ALIGN_CENTER);
 #endif
 
 	dc.End();
@@ -442,40 +511,41 @@ void LogoScreen::render() {
 
 void CreditsScreen::CreateViews() {
 	using namespace UI;
-	I18NCategory *d = GetI18NCategory("Dialog");
-	I18NCategory *c = GetI18NCategory("PSPCredits");
+	I18NCategory *di = GetI18NCategory("Dialog");
+	I18NCategory *cr = GetI18NCategory("PSPCredits");
 
 	root_ = new AnchorLayout(new LayoutParams(FILL_PARENT, FILL_PARENT));
-	Button *back = root_->Add(new Button(d->T("Back"), new AnchorLayoutParams(260, 64, NONE, NONE, 10, 10, false)));
+	Button *back = root_->Add(new Button(di->T("Back"), new AnchorLayoutParams(260, 64, NONE, NONE, 10, 10, false)));
 	back->OnClick.Handle(this, &CreditsScreen::OnOK);
 	root_->SetDefaultFocusView(back);
-#ifndef GOLD
-	root_->Add(new Button(c->T("Buy Gold"), new AnchorLayoutParams(260, 64, 10, NONE, NONE, 10, false)))->OnClick.Handle(this, &CreditsScreen::OnSupport);
-#endif
-	root_->Add(new Button(c->T("PPSSPP Forums"), new AnchorLayoutParams(260, 64, 10, NONE, NONE, 84, false)))->OnClick.Handle(this, &CreditsScreen::OnForums);
+	if (!System_GetPropertyBool(SYSPROP_APP_GOLD)) {
+		root_->Add(new Button(cr->T("Buy Gold"), new AnchorLayoutParams(260, 64, 10, NONE, NONE, 10, false)))->OnClick.Handle(this, &CreditsScreen::OnSupport);
+	}
+	root_->Add(new Button(cr->T("PPSSPP Forums"), new AnchorLayoutParams(260, 64, 10, NONE, NONE, 84, false)))->OnClick.Handle(this, &CreditsScreen::OnForums);
 	root_->Add(new Button("www.ppsspp.org", new AnchorLayoutParams(260, 64, 10, NONE, NONE, 158, false)))->OnClick.Handle(this, &CreditsScreen::OnPPSSPPOrg);
-#ifdef ANDROID
-	root_->Add(new Button(c->T("Share PPSSPP"), new AnchorLayoutParams(260, 64, NONE, NONE, 10, 84, false)))->OnClick.Handle(this, &CreditsScreen::OnShare);
-	root_->Add(new Button(c->T("Twitter @PPSSPP_emu"), new AnchorLayoutParams(260, 64, NONE, NONE, 10, 154, false)))->OnClick.Handle(this, &CreditsScreen::OnTwitter);
+	root_->Add(new Button(cr->T("Privacy Policy"), new AnchorLayoutParams(260, 64, 10, NONE, NONE, 232, false)))->OnClick.Handle(this, &CreditsScreen::OnPrivacy);
+#ifdef __ANDROID__
+	root_->Add(new Button(cr->T("Share PPSSPP"), new AnchorLayoutParams(260, 64, NONE, NONE, 10, 84, false)))->OnClick.Handle(this, &CreditsScreen::OnShare);
+	root_->Add(new Button(cr->T("Twitter @PPSSPP_emu"), new AnchorLayoutParams(260, 64, NONE, NONE, 10, 154, false)))->OnClick.Handle(this, &CreditsScreen::OnTwitter);
 #endif
-#ifdef GOLD
-	root_->Add(new ImageView(I_ICONGOLD, IS_DEFAULT, new AnchorLayoutParams(100, 64, 10, 10, NONE, NONE, false)));
-#else
-	root_->Add(new ImageView(I_ICON, IS_DEFAULT, new AnchorLayoutParams(100, 64, 10, 10, NONE, NONE, false)));
-#endif
+	if (System_GetPropertyBool(SYSPROP_APP_GOLD)) {
+		root_->Add(new ImageView(I_ICONGOLD, IS_DEFAULT, new AnchorLayoutParams(100, 64, 10, 10, NONE, NONE, false)));
+	} else {
+		root_->Add(new ImageView(I_ICON, IS_DEFAULT, new AnchorLayoutParams(100, 64, 10, 10, NONE, NONE, false)));
+	}
 }
 
 UI::EventReturn CreditsScreen::OnSupport(UI::EventParams &e) {
-#ifdef ANDROID
+#ifdef __ANDROID__
 	LaunchBrowser("market://details?id=org.ppsspp.ppssppgold");
 #else
-	LaunchBrowser("http://central.ppsspp.org/buygold");
+	LaunchBrowser("https://central.ppsspp.org/buygold");
 #endif
 	return UI::EVENT_DONE;
 }
 
 UI::EventReturn CreditsScreen::OnTwitter(UI::EventParams &e) {
-#ifdef ANDROID
+#ifdef __ANDROID__
 	System_SendMessage("showTwitter", "PPSSPP_emu");
 #else
 	LaunchBrowser("https://twitter.com/#!/PPSSPP_emu");
@@ -484,51 +554,53 @@ UI::EventReturn CreditsScreen::OnTwitter(UI::EventParams &e) {
 }
 
 UI::EventReturn CreditsScreen::OnPPSSPPOrg(UI::EventParams &e) {
-	LaunchBrowser("http://www.ppsspp.org");
+	LaunchBrowser("https://www.ppsspp.org");
+	return UI::EVENT_DONE;
+}
+
+UI::EventReturn CreditsScreen::OnPrivacy(UI::EventParams &e) {
+	LaunchBrowser("https://www.ppsspp.org/privacy.html");
 	return UI::EVENT_DONE;
 }
 
 UI::EventReturn CreditsScreen::OnForums(UI::EventParams &e) {
-	LaunchBrowser("http://forums.ppsspp.org");
+	LaunchBrowser("https://forums.ppsspp.org");
 	return UI::EVENT_DONE;
 }
 
 UI::EventReturn CreditsScreen::OnShare(UI::EventParams &e) {
-	I18NCategory *c = GetI18NCategory("PSPCredits");
-	System_SendMessage("sharetext", c->T("CheckOutPPSSPP", "Check out PPSSPP, the awesome PSP emulator: http://www.ppsspp.org/"));
+	I18NCategory *cr = GetI18NCategory("PSPCredits");
+	System_SendMessage("sharetext", cr->T("CheckOutPPSSPP", "Check out PPSSPP, the awesome PSP emulator: http://www.ppsspp.org/"));
 	return UI::EVENT_DONE;
 }
 
 UI::EventReturn CreditsScreen::OnOK(UI::EventParams &e) {
-	screenManager()->finishDialog(this, DR_OK);
+	TriggerFinish(DR_OK);
 	return UI::EVENT_DONE;
 }
 
-void CreditsScreen::update(InputState &input_state) {
-	UIScreen::update(input_state);
+void CreditsScreen::update() {
+	UIScreen::update();
 	UpdateUIState(UISTATE_MENU);
-	if (input_state.pad_buttons_down & PAD_BUTTON_BACK) {
-		screenManager()->finishDialog(this, DR_OK);
-	}
 	frames_++;
 }
 
 void CreditsScreen::render() {
 	UIScreen::render();
 
-	I18NCategory *c = GetI18NCategory("PSPCredits");
+	I18NCategory *cr = GetI18NCategory("PSPCredits");
 
 	const char * credits[] = {
 		"PPSSPP",
 		"",
-		c->T("title", "A fast and portable PSP emulator"),
+		cr->T("title", "A fast and portable PSP emulator"),
 		"",
 		"",
-		c->T("created", "Created by"),
+		cr->T("created", "Created by"),
 		"Henrik Rydg\xc3\xa5rd",
 		"",
 		"",
-		c->T("contributors", "Contributors:"),
+		cr->T("contributors", "Contributors:"),
 		"unknownbrackets",
 		"oioitff",
 		"xsacha",
@@ -566,9 +638,11 @@ void CreditsScreen::render() {
 		"Igor Calabria",
 		"Coldbird",
 		"Kyhel",
+		"xebra",
+		"LunaMoo",
+		"zminhquanz",
 		"",
-		"",
-		c->T("specialthanks", "Special thanks to:"),
+		cr->T("specialthanks", "Special thanks to:"),
 		"Maxim for his amazing Atrac3+ decoder work",
 		"Keith Galocy at nVidia (hw, advice)",
 		"Orphis (build server)",
@@ -577,22 +651,20 @@ void CreditsScreen::render() {
 		"solarmystic (testing)",
 		"all the forum mods",
 		"",
-		c->T("this translation by", ""),   // Empty string as this is the original :)
-		c->T("translators1", ""),
-		c->T("translators2", ""),
-		c->T("translators3", ""),
-		c->T("translators4", ""),
-		c->T("translators5", ""),
-		c->T("translators6", ""),
+		cr->T("this translation by", ""),   // Empty string as this is the original :)
+		cr->T("translators1", ""),
+		cr->T("translators2", ""),
+		cr->T("translators3", ""),
+		cr->T("translators4", ""),
+		cr->T("translators5", ""),
+		cr->T("translators6", ""),
 		"",
-		c->T("written", "Written in C++ for speed and portability"),
+		cr->T("written", "Written in C++ for speed and portability"),
 		"",
 		"",
-		c->T("tools", "Free tools used:"),
-#ifdef ANDROID
+		cr->T("tools", "Free tools used:"),
+#ifdef __ANDROID__
 		"Android SDK + NDK",
-#elif defined(BLACKBERRY)
-		"Blackberry NDK",
 #endif
 #if defined(USING_QT_UI)
 		"Qt",
@@ -605,28 +677,32 @@ void CreditsScreen::render() {
 		"PSP SDK",
 		"",
 		"",
-		c->T("website", "Check out the website:"),
+		cr->T("website", "Check out the website:"),
 		"www.ppsspp.org",
-		c->T("list", "compatibility lists, forums, and development info"),
+		cr->T("list", "compatibility lists, forums, and development info"),
 		"",
 		"",
-		c->T("check", "Also check out Dolphin, the best Wii/GC emu around:"),
-		"http://www.dolphin-emu.org",
+		cr->T("check", "Also check out Dolphin, the best Wii/GC emu around:"),
+		"https://www.dolphin-emu.org",
 		"",
 		"",
-		c->T("info1", "PPSSPP is only intended to play games you own."),
-		c->T("info2", "Please make sure that you own the rights to any games"),
-		c->T("info3", "you play by owning the UMD or by buying the digital"),
-		c->T("info4", "download from the PSN store on your real PSP."),
+		cr->T("info1", "PPSSPP is only intended to play games you own."),
+		cr->T("info2", "Please make sure that you own the rights to any games"),
+		cr->T("info3", "you play by owning the UMD or by buying the digital"),
+		cr->T("info4", "download from the PSN store on your real PSP."),
 		"",
 		"",
-		c->T("info5", "PSP is a trademark by Sony, Inc."),
+		cr->T("info5", "PSP is a trademark by Sony, Inc."),
 	};
 
 
 	// TODO: This is kinda ugly, done on every frame...
 	char temp[256];
-	snprintf(temp, sizeof(temp), "PPSSPP %s", PPSSPP_GIT_VERSION);
+	if (System_GetPropertyBool(SYSPROP_APP_GOLD)) {
+		snprintf(temp, sizeof(temp), "PPSSPP Gold %s", PPSSPP_GIT_VERSION);
+	} else {
+		snprintf(temp, sizeof(temp), "PPSSPP %s", PPSSPP_GIT_VERSION);
+	}
 	credits[0] = (const char *)temp;
 
 	UIContext &dc = *screenManager()->getUIContext();
@@ -639,9 +715,11 @@ void CreditsScreen::render() {
 	int y = bounds.y2() - (frames_ % totalHeight);
 	for (int i = 0; i < numItems; i++) {
 		float alpha = linearInOut(y+32, 64, bounds.y2() - 192, 64);
+		uint32_t textColor = colorAlpha(dc.theme->infoStyle.fgColor, alpha);
+
 		if (alpha > 0.0f) {
 			dc.SetFontScale(ease(alpha), ease(alpha));
-			dc.DrawText(credits[i], dc.GetBounds().centerX(), y, whiteAlpha(alpha), ALIGN_HCENTER);
+			dc.DrawText(credits[i], dc.GetBounds().centerX(), y, textColor, ALIGN_HCENTER);
 			dc.SetFontScale(1.0f, 1.0f);
 		}
 		y += itemHeight;

@@ -22,12 +22,6 @@
 
 #pragma once
 
-#ifdef __arm__
-#if !defined(ARM)
-#define ARM
-#endif
-#endif
-
 struct u24_be {
 	unsigned char value[3]; 
 
@@ -36,7 +30,7 @@ struct u24_be {
 	}
 };
 
-#ifdef _WIN32
+#if defined(_MSC_VER)
 
 typedef unsigned __int8 u8;
 typedef unsigned __int16 u16;

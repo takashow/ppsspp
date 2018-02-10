@@ -15,6 +15,9 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include "ppsspp_config.h"
+#if PPSSPP_ARCH(ARM)
+
 #include "Common/CPUDetect.h"
 #include "Core/MemMap.h"
 #include "Core/MIPS/JitCommon/JitCommon.h"
@@ -23,10 +26,12 @@
 
 namespace MIPSComp {
 
-int Jit::Replace_fabsf() {
+int ArmJit::Replace_fabsf() {
 	fpr.MapDirtyIn(0, 12);
 	VABS(fpr.R(0), fpr.R(12));
 	return 4;  // Number of instructions in the MIPS function
 }
 
 }
+
+#endif // PPSSPP_ARCH(ARM)

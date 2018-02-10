@@ -20,8 +20,8 @@
 #include <vector>
 #include <string>
 
+#include "GPU/GPU.h"
 #include "GPU/GPUInterface.h"
-#include "GPU/GPUState.h"
 #include "Core/MemMap.h"
 
 struct GPUDebugOp {
@@ -47,6 +47,7 @@ enum GPUDebugBufferFormat {
 
 	// 565 is just reversed, the others have B and R swapped.
 	GPU_DBG_FORMAT_565_BGRA = 0x04,
+	GPU_DBG_FORMAT_BRSWAP_FLAG = 0x08,
 	GPU_DBG_FORMAT_5551_BGRA = 0x09,
 	GPU_DBG_FORMAT_4444_BGRA = 0x0A,
 	GPU_DBG_FORMAT_8888_BGRA = 0x0B,
@@ -57,6 +58,19 @@ enum GPUDebugBufferFormat {
 	GPU_DBG_FORMAT_8BIT = 0x12,
 	GPU_DBG_FORMAT_24BIT_8X = 0x13,
 	GPU_DBG_FORMAT_24X_8BIT = 0x14,
+
+	GPU_DBG_FORMAT_FLOAT_DIV_256 = 0x18,
+	GPU_DBG_FORMAT_24BIT_8X_DIV_256 = 0x1B,
+
+	// This is used for screenshots, mainly.
+	GPU_DBG_FORMAT_888_RGB = 0x20,
+};
+
+enum GPUDebugFramebufferType {
+	// The current render target.
+	GPU_DBG_FRAMEBUF_RENDER,
+	// The current display target (not the displayed screen, though.)
+	GPU_DBG_FRAMEBUF_DISPLAY,
 };
 
 inline GPUDebugBufferFormat &operator |=(GPUDebugBufferFormat &lhs, const GPUDebugBufferFormat &rhs) {
@@ -117,60 +131,15 @@ struct GPUDebugBuffer {
 		return *this;
 	}
 
-	void Allocate(u32 stride, u32 height, GEBufferFormat fmt, bool flipped = false, bool reversed = false) {
-		GPUDebugBufferFormat actualFmt = GPUDebugBufferFormat(fmt);
-		if (reversed && actualFmt < GPU_DBG_FORMAT_8888) {
-			actualFmt |= GPU_DBG_FORMAT_REVERSE_FLAG;
-		}
-		Allocate(stride, height, actualFmt, flipped);
-	}
-
-	void Allocate(u32 stride, u32 height, GPUDebugBufferFormat fmt, bool flipped = false) {
-		if (alloc_ && stride_ == stride && height_ == height && fmt_ == fmt) {
-			// Already allocated the right size.
-			flipped_ = flipped;
-			return;
-		}
-
-		Free();
-		alloc_ = true;
-		height_ = height;
-		stride_ = stride;
-		fmt_ = fmt;
-		flipped_ = flipped;
-
-		u32 pixelSize;
-		switch (fmt) {
-		case GPU_DBG_FORMAT_8888:
-		case GPU_DBG_FORMAT_8888_BGRA:
-		case GPU_DBG_FORMAT_FLOAT:
-		case GPU_DBG_FORMAT_24BIT_8X:
-		case GPU_DBG_FORMAT_24X_8BIT:
-			pixelSize = 4;
-			break;
-
-		case GPU_DBG_FORMAT_8BIT:
-			pixelSize = 1;
-			break;
-
-		default:
-			pixelSize = 2;
-			break;
-		}
-
-		data_ = new u8[pixelSize * stride * height];
-	}
-
-	void Free() {
-		if (alloc_ && data_ != NULL) {
-			delete [] data_;
-		}
-		data_ = NULL;
-	}
+	void Allocate(u32 stride, u32 height, GEBufferFormat fmt, bool flipped = false, bool reversed = false);
+	void Allocate(u32 stride, u32 height, GPUDebugBufferFormat fmt, bool flipped = false);
+	void Free();
 
 	u8 *GetData() {
 		return data_;
 	}
+
+	u32 GetRawPixel(int x, int y) const;
 
 	const u8 *GetData() const {
 		return data_;
@@ -193,6 +162,8 @@ struct GPUDebugBuffer {
 	}
 
 private:
+	u32 PixelSize(GPUDebugBufferFormat fmt) const;
+
 	bool alloc_;
 	u8 *data_;
 	u32 stride_;
@@ -208,6 +179,9 @@ struct GPUDebugVertex {
 	float y;
 	float z;
 	u8 c[4];
+	float nx;
+	float ny;
+	float nz;
 };
 
 class GPUDebugInterface {
@@ -242,7 +216,7 @@ public:
 
 	// Needs to be called from the GPU thread, so on the same thread as a notification is fine.
 	// Calling from a separate thread (e.g. UI) may fail.
-	virtual bool GetCurrentFramebuffer(GPUDebugBuffer &buffer) {
+	virtual bool GetCurrentFramebuffer(GPUDebugBuffer &buffer, GPUDebugFramebufferType type, int maxRes = -1) {
 		// False means unsupported.
 		return false;
 	}
@@ -259,6 +233,14 @@ public:
 
 	// Similar to GetCurrentFramebuffer(), with texture level specification.
 	virtual bool GetCurrentTexture(GPUDebugBuffer &buffer, int level) {
+		return false;
+	}
+
+	virtual bool GetCurrentClut(GPUDebugBuffer &buffer) {
+		return false;
+	}
+
+	virtual bool GetOutputFramebuffer(GPUDebugBuffer &buffer) {
 		return false;
 	}
 

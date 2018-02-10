@@ -17,7 +17,8 @@
 
 #pragma once
 
-#include "base/functional.h"
+#include <functional>
+
 #include "ui/view.h"
 #include "ui/ui_screen.h"
 
@@ -26,7 +27,7 @@
 class InstallZipScreen : public UIDialogScreenWithBackground {
 public:
 	InstallZipScreen(std::string zipPath) : installChoice_(0), doneView_(0), zipPath_(zipPath), installStarted_(false), deleteZipFile_(false) {}
-	virtual void update(InputState &input) override;
+	virtual void update() override;
 	virtual bool key(const KeyInput &key) override;
 
 protected:

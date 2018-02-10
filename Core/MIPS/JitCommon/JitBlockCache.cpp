@@ -43,22 +43,6 @@
 #include "Core/MIPS/JitCommon/JitBlockCache.h"
 #include "Core/MIPS/JitCommon/JitCommon.h"
 
-#if defined(ARM)
-#include "Common/ArmEmitter.h"
-#include "Core/MIPS/ARM/ArmAsm.h"
-using namespace ArmGen;
-#elif defined(_M_IX86) || defined(_M_X64)
-#include "Common/x64Emitter.h"
-#include "Common/x64Analyzer.h"
-#include "Core/MIPS/x86/Asm.h"
-using namespace Gen;
-#elif defined(PPC)
-#include "Common/ppcEmitter.h"
-#include "Core/MIPS/MIPS.h"
-using namespace PpcGen;
-#else
-#error "Unsupported arch!"
-#endif
 // #include "JitBase.h"
 
 #if defined USE_OPROFILE && USE_OPROFILE
@@ -73,12 +57,10 @@ op_agent_t agent;
 #pragma comment(lib, "jitprofiling.lib")
 #endif
 
-
 const u32 INVALID_EXIT = 0xFFFFFFFF;
-const MIPSOpcode INVALID_ORIGINAL_OP = MIPSOpcode(0x00000001);
 
-JitBlockCache::JitBlockCache(MIPSState *mips, CodeBlock *codeBlock) :
-	mips_(mips), codeBlock_(codeBlock), blocks_(0), num_blocks_(0) {
+JitBlockCache::JitBlockCache(MIPSState *mips, CodeBlockCommon *codeBlock) :
+	codeBlock_(codeBlock), blocks_(nullptr), num_blocks_(0) {
 }
 
 JitBlockCache::~JitBlockCache() {
@@ -104,6 +86,7 @@ void JitBlockCache::Init() {
 }
 
 void JitBlockCache::Shutdown() {
+	Clear(); // Make sure proxy block links are deleted
 	delete [] blocks_;
 	blocks_ = 0;
 	num_blocks_ = 0;
@@ -119,11 +102,11 @@ void JitBlockCache::Shutdown() {
 // This clears the JIT cache. It's called from JitCache.cpp when the JIT cache
 // is full and when saving and loading states.
 void JitBlockCache::Clear() {
-	for (int i = 0; i < num_blocks_; i++)
-		DestroyBlock(i, false);
-	links_to_.clear();
 	block_map_.clear();
-	proxyBlockIndices_.clear();
+	proxyBlockMap_.clear();
+	for (int i = 0; i < num_blocks_; i++)
+		DestroyBlock(i, DestroyType::CLEAR);
+	links_to_.clear();
 	num_blocks_ = 0;
 
 	blockMemRanges_[JITBLOCK_RANGE_SCRATCH] = std::make_pair(0xFFFFFFFF, 0x00000000);
@@ -140,6 +123,10 @@ JitBlock *JitBlockCache::GetBlock(int no) {
 	return &blocks_[no];
 }
 
+const JitBlock *JitBlockCache::GetBlock(int no) const {
+	return &blocks_[no];
+}
+
 int JitBlockCache::AllocateBlock(u32 startAddress) {
 	JitBlock &b = blocks_[num_blocks_];
 
@@ -149,6 +136,7 @@ int JitBlockCache::AllocateBlock(u32 startAddress) {
 	int num = GetBlockNumberFromStartAddress(startAddress, false);
 	if (num >= 0) {
 		if (blocks_[num].IsPureProxy()) {
+			RemoveBlockMap(num);
 			blocks_[num].invalid = true;
 			b.proxyFor = new std::vector<u32>();
 			*b.proxyFor = *blocks_[num].proxyFor;
@@ -175,7 +163,7 @@ void JitBlockCache::ProxyBlock(u32 rootAddress, u32 startAddress, u32 size, cons
 	// instead of creating a new block.
 	int num = GetBlockNumberFromStartAddress(startAddress, false);
 	if (num != -1) {
-		INFO_LOG(HLE, "Adding proxy root %08x to block at %08x", rootAddress, startAddress);
+		DEBUG_LOG(HLE, "Adding proxy root %08x to block at %08x", rootAddress, startAddress);
 		if (!blocks_[num].proxyFor) {
 			blocks_[num].proxyFor = new std::vector<u32>();
 		}
@@ -198,9 +186,40 @@ void JitBlockCache::ProxyBlock(u32 rootAddress, u32 startAddress, u32 size, cons
 
 	// Make binary searches and stuff work ok
 	b.normalEntry = codePtr;
-	b.checkedEntry = codePtr;
-	proxyBlockIndices_.push_back(num_blocks_);
+	b.checkedEntry = (u8 *)codePtr;  // Ugh, casting away const..
+	proxyBlockMap_.insert(std::make_pair(startAddress, num_blocks_));
+	AddBlockMap(num_blocks_);
+
 	num_blocks_++; //commit the current block
+}
+
+void JitBlockCache::AddBlockMap(int block_num) {
+	const JitBlock &b = blocks_[block_num];
+	// Convert the logical address to a physical address for the block map
+	// Yeah, this'll work fine for PSP too I think.
+	u32 pAddr = b.originalAddress & 0x1FFFFFFF;
+	block_map_[std::make_pair(pAddr + 4 * b.originalSize, pAddr)] = block_num;
+}
+
+void JitBlockCache::RemoveBlockMap(int block_num) {
+	const JitBlock &b = blocks_[block_num];
+	if (b.invalid) {
+		return;
+	}
+
+	const u32 pAddr = b.originalAddress & 0x1FFFFFFF;
+	auto it = block_map_.find(std::make_pair(pAddr + 4 * b.originalSize, pAddr));
+	if (it != block_map_.end() && it->second == (u32)block_num) {
+		block_map_.erase(it);
+	} else {
+		// It wasn't in there, or it has the wrong key.  Let's search...
+		for (auto it = block_map_.begin(); it != block_map_.end(); ++it) {
+			if (it->second == (u32)block_num) {
+				block_map_.erase(it);
+				break;
+			}
+		}
+	}
 }
 
 static void ExpandRange(std::pair<u32, u32> &range, u32 newStart, u32 newEnd) {
@@ -215,17 +234,12 @@ void JitBlockCache::FinalizeBlock(int block_num, bool block_link) {
 	MIPSOpcode opcode = GetEmuHackOpForBlock(block_num);
 	Memory::Write_Opcode_JIT(b.originalAddress, opcode);
 
-	// Convert the logical address to a physical address for the block map
-	// Yeah, this'll work fine for PSP too I think.
-	u32 pAddr = b.originalAddress & 0x1FFFFFFF;
+	AddBlockMap(block_num);
 
-	u32 latestExit = 0;
-	block_map_[std::make_pair(pAddr + 4 * b.originalSize - 1, pAddr)] = block_num;
 	if (block_link) {
 		for (int i = 0; i < MAX_JIT_BLOCK_EXITS; i++) {
 			if (b.exitAddress[i] != INVALID_EXIT) {
-				links_to_.insert(std::pair<u32, int>(b.exitAddress[i], block_num));
-				latestExit = std::max(latestExit, b.exitAddress[i]);
+				links_to_.insert(std::make_pair(b.exitAddress[i], block_num));
 			}
 		}
 
@@ -233,15 +247,16 @@ void JitBlockCache::FinalizeBlock(int block_num, bool block_link) {
 		LinkBlockExits(block_num);
 	}
 
+	const u32 blockEnd = b.originalAddress + b.originalSize * 4 - 4;
 	if (Memory::IsScratchpadAddress(b.originalAddress)) {
-		ExpandRange(blockMemRanges_[JITBLOCK_RANGE_SCRATCH], b.originalAddress, latestExit);
+		ExpandRange(blockMemRanges_[JITBLOCK_RANGE_SCRATCH], b.originalAddress, blockEnd);
 	}
 	const u32 halfUserMemory = (PSP_GetUserMemoryEnd() - PSP_GetUserMemoryBase()) / 2;
 	if (b.originalAddress < PSP_GetUserMemoryBase() + halfUserMemory) {
-		ExpandRange(blockMemRanges_[JITBLOCK_RANGE_RAMBOTTOM], b.originalAddress, latestExit);
+		ExpandRange(blockMemRanges_[JITBLOCK_RANGE_RAMBOTTOM], b.originalAddress, blockEnd);
 	}
-	if (latestExit > PSP_GetUserMemoryBase() + halfUserMemory) {
-		ExpandRange(blockMemRanges_[JITBLOCK_RANGE_RAMTOP], b.originalAddress, latestExit);
+	if (blockEnd > PSP_GetUserMemoryBase() + halfUserMemory) {
+		ExpandRange(blockMemRanges_[JITBLOCK_RANGE_RAMTOP], b.originalAddress, blockEnd);
 	}
 
 #if defined USE_OPROFILE && USE_OPROFILE
@@ -315,7 +330,7 @@ MIPSOpcode JitBlockCache::GetEmuHackOpForBlock(int blockNum) const {
 	return MIPSOpcode(MIPS_EMUHACK_OPCODE | off);
 }
 
-int JitBlockCache::GetBlockNumberFromStartAddress(u32 addr, bool realBlocksOnly) {
+int JitBlockCache::GetBlockNumberFromStartAddress(u32 addr, bool realBlocksOnly) const {
 	if (!blocks_ || !Memory::IsValidAddress(addr))
 		return -1;
 
@@ -323,9 +338,10 @@ int JitBlockCache::GetBlockNumberFromStartAddress(u32 addr, bool realBlocksOnly)
 	int bl = GetBlockNumberFromEmuHackOp(inst);
 	if (bl < 0) {
 		if (!realBlocksOnly) {
-			// Wasn't an emu hack op, look through proxyBlockIndices_.
-			for (size_t i = 0; i < proxyBlockIndices_.size(); i++) {
-				int blockIndex = proxyBlockIndices_[i];
+			// Wasn't an emu hack op, look through proxyBlockMap_.
+			auto range = proxyBlockMap_.equal_range(addr);
+			for (auto it = range.first; it != range.second; ++it) {
+				const int blockIndex = it->second;
 				if (blocks_[blockIndex].originalAddress == addr && !blocks_[blockIndex].proxyFor && !blocks_[blockIndex].invalid)
 					return blockIndex;
 			}
@@ -373,42 +389,37 @@ void JitBlockCache::LinkBlockExits(int i) {
 		// This block is dead. Don't relink it.
 		return;
 	}
+	if (b.IsPureProxy()) {
+		// Pure proxies can't link, since they don't have code.
+		return;
+	}
 
 	for (int e = 0; e < MAX_JIT_BLOCK_EXITS; e++) {
 		if (b.exitAddress[e] != INVALID_EXIT && !b.linkStatus[e]) {
-			int destinationBlock = GetBlockNumberFromStartAddress(b.exitAddress[e]);
-			if (destinationBlock != -1) 	{
-#if defined(ARM)
-				ARMXEmitter emit(b.exitPtrs[e]);
-				emit.B(blocks_[destinationBlock].checkedEntry);
-				emit.FlushIcache();
+			int destinationBlock = GetBlockNumberFromStartAddress(b.exitAddress[e], true);
+			if (destinationBlock == -1) {
+				continue;
+			}
 
-#elif defined(_M_IX86) || defined(_M_X64)
-				XEmitter emit(b.exitPtrs[e]);
-				emit.JMP(blocks_[destinationBlock].checkedEntry, true);
-#elif defined(PPC)
-				PPCXEmitter emit(b.exitPtrs[e]);
-				emit.B(blocks_[destinationBlock].checkedEntry);
-				emit.FlushIcache();
-#endif
+			JitBlock &eb = blocks_[destinationBlock];
+			// Make sure the destination is not invalid.
+			if (!eb.invalid) {
+				MIPSComp::jit->LinkBlock(b.exitPtrs[e], eb.checkedEntry);
 				b.linkStatus[e] = true;
 			}
 		}
 	}
 }
 
-using namespace std;
-
 void JitBlockCache::LinkBlock(int i) {
 	LinkBlockExits(i);
 	JitBlock &b = blocks_[i];
-	pair<multimap<u32, int>::iterator, multimap<u32, int>::iterator> ppp;
 	// equal_range(b) returns pair<iterator,iterator> representing the range
 	// of element with key b
-	ppp = links_to_.equal_range(b.originalAddress);
+	auto ppp = links_to_.equal_range(b.originalAddress);
 	if (ppp.first == ppp.second)
 		return;
-	for (multimap<u32, int>::iterator iter = ppp.first; iter != ppp.second; ++iter) {
+	for (auto iter = ppp.first; iter != ppp.second; ++iter) {
 		// PanicAlert("Linking block %i to block %i", iter->second, i);
 		LinkBlockExits(iter->second);
 	}
@@ -416,11 +427,10 @@ void JitBlockCache::LinkBlock(int i) {
 
 void JitBlockCache::UnlinkBlock(int i) {
 	JitBlock &b = blocks_[i];
-	pair<multimap<u32, int>::iterator, multimap<u32, int>::iterator> ppp;
-	ppp = links_to_.equal_range(b.originalAddress);
+	auto ppp = links_to_.equal_range(b.originalAddress);
 	if (ppp.first == ppp.second)
 		return;
-	for (multimap<u32, int>::iterator iter = ppp.first; iter != ppp.second; ++iter) {
+	for (auto iter = ppp.first; iter != ppp.second; ++iter) {
 		JitBlock &sourceBlock = blocks_[iter->second];
 		for (int e = 0; e < MAX_JIT_BLOCK_EXITS; e++) {
 			if (sourceBlock.exitAddress[e] == b.originalAddress)
@@ -439,12 +449,13 @@ std::vector<u32> JitBlockCache::SaveAndClearEmuHackOps() {
 			continue;
 
 		const u32 emuhack = GetEmuHackOpForBlock(block_num).encoding;
-		result[block_num] = emuhack;
-		// The goal here is to prevent restoring it if it did not match (in case originalFirstOpcode does match.)
-		if (Memory::ReadUnchecked_U32(b.originalAddress) != emuhack)
-			b.originalFirstOpcode = INVALID_ORIGINAL_OP;
-		else
+		if (Memory::ReadUnchecked_U32(b.originalAddress) == emuhack)
+		{
+			result[block_num] = emuhack;
 			Memory::Write_Opcode_JIT(b.originalAddress, b.originalFirstOpcode);
+		}
+		else
+			result[block_num] = 0;
 	}
 
 	return result;
@@ -458,7 +469,7 @@ void JitBlockCache::RestoreSavedEmuHackOps(std::vector<u32> saved) {
 
 	for (int block_num = 0; block_num < num_blocks_; ++block_num) {
 		const JitBlock &b = blocks_[block_num];
-		if (b.invalid)
+		if (b.invalid || saved[block_num] == 0)
 			continue;
 
 		// Only if we restored it, write it back.
@@ -467,12 +478,14 @@ void JitBlockCache::RestoreSavedEmuHackOps(std::vector<u32> saved) {
 	}
 }
 
-void JitBlockCache::DestroyBlock(int block_num, bool invalidate) {
+void JitBlockCache::DestroyBlock(int block_num, DestroyType type) {
 	if (block_num < 0 || block_num >= num_blocks_) {
 		ERROR_LOG_REPORT(JIT, "DestroyBlock: Invalid block number %d", block_num);
 		return;
 	}
 	JitBlock *b = &blocks_[block_num];
+	// No point it being in there anymore.
+	RemoveBlockMap(block_num);
 
 	// Pure proxy blocks always point directly to a real block, there should be no chains of
 	// proxy-only blocks pointing to proxy-only blocks.
@@ -484,75 +497,169 @@ void JitBlockCache::DestroyBlock(int block_num, bool invalidate) {
 			int proxied_blocknum = GetBlockNumberFromStartAddress((*b->proxyFor)[i], false);
 			// If it was already cleared, we don't know which to destroy.
 			if (proxied_blocknum != -1) {
-				DestroyBlock(proxied_blocknum, invalidate);
+				DestroyBlock(proxied_blocknum, type);
 			}
 		}
 		b->proxyFor->clear();
 		delete b->proxyFor;
 		b->proxyFor = 0;
 	}
-	// TODO: Remove from proxyBlockIndices_.
+	auto range = proxyBlockMap_.equal_range(b->originalAddress);
+	for (auto it = range.first; it != range.second; ++it) {
+		if (it->second == block_num) {
+			// Found it.  Delete and bail.
+			proxyBlockMap_.erase(it);
+			break;
+		}
+	}
 
 	// TODO: Handle the case when there's a proxy block and a regular JIT block at the same location.
 	// In this case we probably "leak" the proxy block currently (no memory leak but it'll stay enabled).
 
 	if (b->invalid) {
-		if (invalidate)
+		if (type == DestroyType::INVALIDATE)
 			ERROR_LOG(JIT, "Invalidating invalid block %d", block_num);
 		return;
 	}
 
 	b->invalid = true;
-	if (Memory::ReadUnchecked_U32(b->originalAddress) == GetEmuHackOpForBlock(block_num).encoding)
-		Memory::Write_Opcode_JIT(b->originalAddress, b->originalFirstOpcode);
+	if (!b->IsPureProxy()) {
+		if (Memory::ReadUnchecked_U32(b->originalAddress) == GetEmuHackOpForBlock(block_num).encoding)
+			Memory::Write_Opcode_JIT(b->originalAddress, b->originalFirstOpcode);
+	}
 
 	// It's not safe to set normalEntry to 0 here, since we use a binary search
 	// that looks at that later to find blocks. Marking it invalid is enough.
 
 	UnlinkBlock(block_num);
 
-#if defined(ARM)
+	// Don't change the jit code when invalidating a pure proxy block.
+	if (b->IsPureProxy()) {
+		return;
+	}
 
-	// Send anyone who tries to run this block back to the dispatcher.
-	// Not entirely ideal, but .. pretty good.
-	// I hope there's enough space...
-	// checkedEntry is the only "linked" entrance so it's enough to overwrite that.
-	ARMXEmitter emit((u8 *)b->checkedEntry);
-	emit.MOVI2R(R0, b->originalAddress);
-	emit.STR(R0, CTXREG, offsetof(MIPSState, pc));
-	emit.B(MIPSComp::jit->dispatcher);
-	emit.FlushIcache();
-
-#elif defined(_M_IX86) || defined(_M_X64)
-
-	// Send anyone who tries to run this block back to the dispatcher.
-	// Not entirely ideal, but .. pretty good.
-	// Spurious entrances from previously linked blocks can only come through checkedEntry
-	XEmitter emit((u8 *)b->checkedEntry);
-	emit.MOV(32, M(&mips_->pc), Imm32(b->originalAddress));
-	emit.JMP(MIPSComp::jit->Asm().dispatcher, true);
-#elif defined(PPC)
-	PPCXEmitter emit((u8 *)b->checkedEntry);
-	emit.MOVI2R(R3, b->originalAddress);
-	emit.STW(R0, CTXREG, offsetof(MIPSState, pc));
-	emit.B(MIPSComp::jit->dispatcher);
-	emit.FlushIcache();
-#endif
+	if (b->checkedEntry) {
+		// We can skip this if we're clearing anyway, which cuts down on protect back and forth on WX exclusive.
+		if (type != DestroyType::CLEAR) {
+			MIPSComp::jit->UnlinkBlock(b->checkedEntry, b->originalAddress);
+		}
+	} else {
+		ERROR_LOG(JIT, "Unlinking block with no entry: %08x (%d)", b->originalAddress, block_num);
+	}
 }
 
 void JitBlockCache::InvalidateICache(u32 address, const u32 length) {
 	// Convert the logical address to a physical address for the block map
-	u32 pAddr = address & 0x1FFFFFFF;
+	const u32 pAddr = address & 0x1FFFFFFF;
+	const u32 pEnd = pAddr + length;
 
-	// destroy JIT blocks
-	// !! this works correctly under assumption that any two overlapping blocks end at the same address
-	// TODO: This may not be a safe assumption with jit continuing enabled.
-	std::map<pair<u32,u32>, u32>::iterator it1 = block_map_.lower_bound(std::make_pair(pAddr, 0)), it2 = it1;
-	while (it2 != block_map_.end() && it2->first.second < pAddr + length) {
-		DestroyBlock(it2->second, true);
-		it2++;
+	if (pEnd < pAddr) {
+		ERROR_LOG(JIT, "Bad InvalidateICache: %08x with len=%d", address, length);
+		return;
 	}
 
-	if (it1 != it2)
-		block_map_.erase(it1, it2);
+	if (pAddr == 0 && pEnd >= 0x1FFFFFFF) {
+		InvalidateChangedBlocks();
+		return;
+	}
+
+	// Blocks may start and end in overlapping ways, and destroying one invalidates iterators.
+	// So after destroying one, we start over.
+	do {
+	restart:
+		auto next = block_map_.lower_bound(std::make_pair(pAddr, 0));
+		auto last = block_map_.upper_bound(std::make_pair(pEnd + MAX_BLOCK_INSTRUCTIONS, 0));
+		// Note that if next is end(), last will be end() too (equal.)
+		for (; next != last; ++next) {
+			const u32 blockStart = next->first.second;
+			const u32 blockEnd = next->first.first;
+			if (blockStart < pEnd && blockEnd > pAddr) {
+				DestroyBlock(next->second, DestroyType::INVALIDATE);
+				// Our iterator is now invalid.  Break and search again.
+				// Most of the time there shouldn't be a bunch of matching blocks.
+				goto restart;
+			}
+		}
+		// We got here - it wasn't in the map at all (or anymore.)
+	} while (false);
+}
+
+void JitBlockCache::InvalidateChangedBlocks() {
+	// The primary goal of this is to make sure block linking is cleared up.
+	for (int block_num = 0; block_num < num_blocks_; ++block_num) {
+		JitBlock &b = blocks_[block_num];
+		if (b.invalid || b.IsPureProxy())
+			continue;
+
+		const u32 emuhack = GetEmuHackOpForBlock(block_num).encoding;
+		if (Memory::ReadUnchecked_U32(b.originalAddress) != emuhack) {
+			DEBUG_LOG(JIT, "Invalidating changed block at %08x", b.originalAddress);
+			DestroyBlock(block_num, DestroyType::INVALIDATE);
+		}
+	}
+}
+
+int JitBlockCache::GetBlockExitSize() {
+#if defined(ARM)
+	// Will depend on the sequence found to encode the destination address.
+	return 0;
+#elif defined(_M_IX86) || defined(_M_X64)
+	return 15;
+#elif defined(ARM64)
+	// Will depend on the sequence found to encode the destination address.
+	return 0;
+#else
+#warning GetBlockExitSize unimplemented
+	return 0;
+#endif
+}
+
+void JitBlockCache::ComputeStats(BlockCacheStats &bcStats) const {
+	double totalBloat = 0.0;
+	double maxBloat = 0.0;
+	double minBloat = 1000000000.0;
+	for (int i = 0; i < num_blocks_; i++) {
+		const JitBlock *b = GetBlock(i);
+		double codeSize = (double)b->codeSize;
+		if (codeSize == 0)
+			continue;
+		double origSize = (double)(4 * b->originalSize);
+		double bloat = codeSize / origSize;
+		if (bloat < minBloat) {
+			minBloat = bloat;
+			bcStats.minBloatBlock = b->originalAddress;
+		}
+		if (bloat > maxBloat) {
+			maxBloat = bloat;
+			bcStats.maxBloatBlock = b->originalAddress;
+		}
+		totalBloat += bloat;
+		bcStats.bloatMap[bloat] = b->originalAddress;
+	}
+	bcStats.numBlocks = num_blocks_;
+	bcStats.minBloat = minBloat;
+	bcStats.maxBloat = maxBloat;
+	bcStats.avgBloat = totalBloat / (double)num_blocks_;
+}
+
+JitBlockDebugInfo JitBlockCache::GetBlockDebugInfo(int blockNum) const {
+	JitBlockDebugInfo debugInfo{};
+	const JitBlock *block = GetBlock(blockNum);
+	debugInfo.originalAddress = block->originalAddress;
+	for (u32 addr = block->originalAddress; addr <= block->originalAddress + block->originalSize * 4; addr += 4) {
+		char temp[256];
+		MIPSDisAsm(Memory::Read_Instruction(addr), addr, temp, true);
+		std::string mipsDis = temp;
+		debugInfo.origDisasm.push_back(mipsDis);
+	}
+
+#if defined(ARM)
+	debugInfo.targetDisasm = DisassembleArm2(block->normalEntry, block->codeSize);
+#elif defined(ARM64)
+	debugInfo.targetDisasm = DisassembleArm64(block->normalEntry, block->codeSize);
+#elif defined(_M_IX86) || defined(_M_X64)
+	debugInfo.targetDisasm = DisassembleX86(block->normalEntry, block->codeSize);
+#endif
+
+	return debugInfo;
 }

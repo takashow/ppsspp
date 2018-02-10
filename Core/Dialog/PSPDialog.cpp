@@ -18,6 +18,7 @@
 #include "i18n/i18n.h"
 
 #include "Common/ChunkFile.h"
+#include "Common/StringUtils.h"
 #include "Core/CoreTiming.h"
 #include "Core/HLE/sceCtrl.h"
 #include "Core/Util/PPGeDraw.h"
@@ -198,24 +199,24 @@ void PSPDialog::DisplayButtons(int flags, const char *caption)
 	char safeCaption[65] = {0};
 	if (caption != NULL && *caption != '\0') {
 		useCaption = true;
-		strncpy(safeCaption, caption, 64);
+		truncate_cpy(safeCaption, caption);
 	}
 
-	I18NCategory *d = GetI18NCategory("Dialog");
+	I18NCategory *di = GetI18NCategory("Dialog");
 	float x1 = 183.5f, x2 = 261.5f;
 	if (GetCommonParam()->buttonSwap == 1) {
 		x1 = 261.5f;
 		x2 = 183.5f;
 	}
 	if (flags & DS_BUTTON_OK) {
-		const char *text = useCaption ? safeCaption : d->T("Enter");
+		const char *text = useCaption ? safeCaption : di->T("Enter");
 		PPGeDrawImage(okButtonImg, x2, 258, 11.5f, 11.5f, 0, CalcFadedColor(0x80000000));
 		PPGeDrawImage(okButtonImg, x2, 256, 11.5f, 11.5f, 0, CalcFadedColor(0xFFFFFFFF));
 		PPGeDrawText(text, x2 + 15.5f, 254, PPGE_ALIGN_LEFT, FONT_SCALE, CalcFadedColor(0x80000000));
 		PPGeDrawText(text, x2 + 14.5f, 252, PPGE_ALIGN_LEFT, FONT_SCALE, CalcFadedColor(0xFFFFFFFF));
 	}
 	if (flags & DS_BUTTON_CANCEL) {
-		const char *text = useCaption ? safeCaption : d->T("Back");
+		const char *text = useCaption ? safeCaption : di->T("Back");
 		PPGeDrawText(text, x1 + 15.5f, 254, PPGE_ALIGN_LEFT, FONT_SCALE, CalcFadedColor(0x80000000));
 		PPGeDrawText(text, x1 + 14.5f, 252, PPGE_ALIGN_LEFT, FONT_SCALE, CalcFadedColor(0xFFFFFFFF));
 		PPGeDrawImage(cancelButtonImg, x1, 258, 11.5f, 11.5f, 0, CalcFadedColor(0x80000000));

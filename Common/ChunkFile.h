@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "ppsspp_config.h"
+
 // Extremely simple serialization framework.
 // Currently mis-named, a native ChunkFile is something different (a RIFF file)
 
@@ -27,25 +29,17 @@
 // + Sections can be versioned for backwards/forwards compatibility
 // - Serialization code for anything complex has to be manually written.
 
+#include <cstdlib>
 #include <map>
+#include <unordered_map>
 #include <deque>
 #include <list>
 #include <set>
-#if defined(IOS) || defined(MACGNUSTD)
-#include <tr1/type_traits>
-#else
 #include <type_traits>
-#endif
 
 #include "Common.h"
+#include "Swap.h"
 #include "FileUtil.h"
-#include "../ext/snappy/snappy-c.h"
-
-#if defined(IOS) || defined(MACGNUSTD)
-namespace std {
-	using tr1::is_pointer;
-}
-#endif
 
 template <class T>
 struct LinkedListItem : public T
@@ -178,7 +172,29 @@ public:
 	}
 
 	template<class K, class T>
-	void DoMap(std::map<K, T> &x, T &default_val)
+	void Do(std::unordered_map<K, T *> &x)
+	{
+		if (mode == MODE_READ)
+		{
+			for (auto it = x.begin(), end = x.end(); it != end; ++it)
+			{
+				if (it->second != NULL)
+					delete it->second;
+			}
+		}
+		T *dv = NULL;
+		DoMap(x, dv);
+	}
+
+	template<class K, class T>
+	void Do(std::unordered_map<K, T> &x)
+	{
+		T dv = T();
+		DoMap(x, dv);
+	}
+
+	template<class M>
+	void DoMap(M &x, typename M::mapped_type &default_val)
 	{
 		unsigned int number = (unsigned int)x.size();
 		Do(number);
@@ -188,9 +204,9 @@ public:
 				x.clear();
 				while (number > 0)
 				{
-					K first = K();
+					typename M::key_type first = typename M::key_type();
 					Do(first);
-					T second = default_val;
+					typename M::mapped_type second = default_val;
 					Do(second);
 					x[first] = second;
 					--number;
@@ -201,10 +217,10 @@ public:
 		case MODE_MEASURE:
 		case MODE_VERIFY:
 			{
-				typename std::map<K, T>::iterator itr = x.begin();
+				typename M::iterator itr = x.begin();
 				while (number > 0)
 				{
-					K first = itr->first;
+					typename M::key_type first = itr->first;
 					Do(first);
 					Do(itr->second);
 					--number;
@@ -238,7 +254,29 @@ public:
 	}
 
 	template<class K, class T>
-	void DoMultimap(std::multimap<K, T> &x, T &default_val)
+	void Do(std::unordered_multimap<K, T *> &x)
+	{
+		if (mode == MODE_READ)
+		{
+			for (auto it = x.begin(), end = x.end(); it != end; ++it)
+			{
+				if (it->second != NULL)
+					delete it->second;
+			}
+		}
+		T *dv = NULL;
+		DoMultimap(x, dv);
+	}
+
+	template<class K, class T>
+	void Do(std::unordered_multimap<K, T> &x)
+	{
+		T dv = T();
+		DoMultimap(x, dv);
+	}
+
+	template<class M>
+	void DoMultimap(M &x, typename M::mapped_type &default_val)
 	{
 		unsigned int number = (unsigned int)x.size();
 		Do(number);
@@ -248,9 +286,9 @@ public:
 				x.clear();
 				while (number > 0)
 				{
-					K first = K();
+					typename M::key_type first = typename M::key_type();
 					Do(first);
-					T second = default_val;
+					typename M::mapped_type second = default_val;
 					Do(second);
 					x.insert(std::make_pair(first, second));
 					--number;
@@ -261,7 +299,7 @@ public:
 		case MODE_MEASURE:
 		case MODE_VERIFY:
 			{
-				typename std::multimap<K, T>::iterator itr = x.begin();
+				typename M::iterator itr = x.begin();
 				while (number > 0)
 				{
 					Do(itr->first);
@@ -415,7 +453,7 @@ public:
 			break;
 
 		default:
-			ERROR_LOG(COMMON, "Savestate error: invalid mode %d.", mode);
+			ERROR_LOG(SAVESTATE, "Savestate error: invalid mode %d.", mode);
 		}
 	}
 
@@ -501,6 +539,11 @@ public:
 			}
 			else
 			{
+				if (shouldExist != 0)
+				{
+					WARN_LOG(SAVESTATE, "Savestate failure: incorrect item marker %d", shouldExist);
+					SetError(ERROR_FAILURE);
+				}
 				if (mode == MODE_READ)
 				{
 					if (prev)
@@ -537,6 +580,7 @@ public:
 		ERROR_NONE,
 		ERROR_BAD_FILE,
 		ERROR_BROKEN_STATE,
+		ERROR_BAD_ALLOC,
 	};
 
 	// May fail badly if ptr doesn't point to valid data.
@@ -578,38 +622,39 @@ public:
 
 	// Load file template
 	template<class T>
-	static Error Load(const std::string& _rFilename, int _Revision, const char *_VersionString, T& _class, std::string* _failureReason) 
+	static Error Load(const std::string &filename, const char *gitVersion, T& _class, std::string *failureReason)
 	{
-		*_failureReason = "LoadStateWrongVersion";
+		*failureReason = "LoadStateWrongVersion";
 
-		u8 *ptr;
+		u8 *ptr = nullptr;
 		size_t sz;
-		Error error = LoadFile(_rFilename, _Revision, _VersionString, ptr, sz, _failureReason);
+		Error error = LoadFile(filename, gitVersion, ptr, sz, failureReason);
 		if (error == ERROR_NONE) {
-			u8 *buf = ptr;
 			error = LoadPtr(ptr, _class);
-			delete[] buf;
+			delete [] ptr;
 		}
 		
-		INFO_LOG(COMMON, "ChunkReader: Done loading %s" , _rFilename.c_str());
+		INFO_LOG(SAVESTATE, "ChunkReader: Done loading %s", filename.c_str());
 		if (error == ERROR_NONE) {
-			_failureReason->clear();
+			failureReason->clear();
 		}
 		return error;
 	}
 
 	// Save file template
 	template<class T>
-	static Error Save(const std::string& _rFilename, int _Revision, const char *_VersionString, T& _class)
+	static Error Save(const std::string &filename, const std::string &title, const char *gitVersion, T& _class)
 	{
 		// Get data
 		size_t const sz = MeasurePtr(_class);
-		u8 *buffer = new u8[sz];
+		u8 *buffer = (u8 *)malloc(sz);
+		if (!buffer)
+			return ERROR_BAD_ALLOC;
 		Error error = SavePtr(buffer, _class);
 
+		// SaveFile takes ownership of buffer
 		if (error == ERROR_NONE)
-			error = SaveFile(_rFilename, _Revision, _VersionString, buffer, sz);
-
+			error = SaveFile(filename, title, gitVersion, buffer, sz);
 		return error;
 	}
 	
@@ -637,10 +682,9 @@ public:
 		return ERROR_NONE;
 	}
 
-private:
-	static CChunkFileReader::Error LoadFile(const std::string& _rFilename, int _Revision, const char *_VersionString, u8 *&buffer, size_t &sz, std::string *_failureReason);
-	static CChunkFileReader::Error SaveFile(const std::string& _rFilename, int _Revision, const char *_VersionString, u8 *buffer, size_t sz);
+	static Error GetFileTitle(const std::string &filename, std::string *title);
 
+private:
 	struct SChunkHeader
 	{
 		int Revision;
@@ -649,4 +693,14 @@ private:
 		u32 UncompressedSize;
 		char GitVersion[32];
 	};
+
+	enum {
+		REVISION_MIN = 4,
+		REVISION_TITLE = 5,
+		REVISION_CURRENT = REVISION_TITLE,
+	};
+
+	static Error LoadFile(const std::string &filename, const char *gitVersion, u8 *&buffer, size_t &sz, std::string *failureReason);
+	static Error SaveFile(const std::string &filename, const std::string &title, const char *gitVersion, u8 *buffer, size_t sz);
+	static Error LoadFileHeader(File::IOFile &pFile, SChunkHeader &header, std::string *title);
 };

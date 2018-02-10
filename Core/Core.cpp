@@ -15,13 +15,18 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include "ppsspp_config.h"
+
 #include <set>
+#include <chrono>
+#include <mutex>
+#include <condition_variable>
 
 #include "base/NativeApp.h"
 #include "base/display.h"
-#include "base/mutex.h"
 #include "base/timeutil.h"
-#include "input/input_state.h"
+#include "thread/threadutil.h"
+#include "profiler/profiler.h"
 
 #include "Core/Core.h"
 #include "Core/Config.h"
@@ -29,12 +34,9 @@
 #include "Core/SaveState.h"
 #include "Core/System.h"
 #include "Core/MIPS/MIPS.h"
+#include "Common/GraphicsContext.h"
 
 #ifdef _WIN32
-#ifndef _XBOX
-#include "Windows/OpenGLBase.h"
-#include "Windows/D3D9Base.h"
-#endif
 #include "Windows/InputDevice.h"
 #endif
 
@@ -42,23 +44,34 @@
 
 #include "Core/Debugger/Breakpoints.h"
 
-static event m_hStepEvent;
-static recursive_mutex m_hStepMutex;
-static event m_hInactiveEvent;
-static recursive_mutex m_hInactiveMutex;
+// Time until we stop considering the core active without user input.
+// Should this be configurable?  2 hours currently.
+static const double ACTIVITY_IDLE_TIMEOUT = 2.0 * 3600.0;
+
+static std::condition_variable m_StepCond;
+static std::mutex m_hStepMutex;
+static std::condition_variable m_InactiveCond;
+static std::mutex m_hInactiveMutex;
 static bool singleStepPending = false;
 static std::set<Core_ShutdownFunc> shutdownFuncs;
 static bool windowHidden = false;
+static double lastActivity = 0.0;
+static double lastKeepAwake = 0.0;
+static GraphicsContext *graphicsContext;
+static bool powerSaving = false;
 
-#ifdef _WIN32
-InputState input_state;
-#else
-extern InputState input_state;
-#endif
+void Core_SetGraphicsContext(GraphicsContext *ctx) {
+	graphicsContext = ctx;
+	PSP_CoreParameter().graphicsContext = graphicsContext;
+}
 
 void Core_NotifyWindowHidden(bool hidden) {
 	windowHidden = hidden;
 	// TODO: Wait until we can react?
+}
+
+void Core_NotifyActivity() {
+	lastActivity = time_now_d();
 }
 
 void Core_ListenShutdown(Core_ShutdownFunc func) {
@@ -84,7 +97,7 @@ void Core_Halt(const char *msg)  {
 void Core_Stop() {
 	Core_UpdateState(CORE_POWERDOWN);
 	Core_NotifyShutdown();
-	m_hStepEvent.notify_one();
+	m_StepCond.notify_one();
 }
 
 bool Core_IsStepping() {
@@ -101,37 +114,73 @@ bool Core_IsInactive() {
 
 void Core_WaitInactive() {
 	while (Core_IsActive()) {
-		m_hInactiveEvent.wait(m_hInactiveMutex);
+		std::unique_lock<std::mutex> guard(m_hInactiveMutex);
+		m_InactiveCond.wait(guard);
 	}
 }
 
 void Core_WaitInactive(int milliseconds) {
 	if (Core_IsActive()) {
-		m_hInactiveEvent.wait_for(m_hInactiveMutex, milliseconds);
+		std::unique_lock<std::mutex> guard(m_hInactiveMutex);
+		m_InactiveCond.wait_for(guard, std::chrono::milliseconds(milliseconds));
 	}
 }
 
-void UpdateScreenScale(int width, int height) {
-	dp_xres = width;
-	dp_yres = height;
-	pixel_xres = width;
-	pixel_yres = height;
-	g_dpi = 72;
-	g_dpi_scale = 1.0f;
-#ifdef __SYMBIAN32__
-	dp_xres *= 1.4f;
-	dp_yres *= 1.4f;
-	g_dpi_scale = 1.4f;
-#endif
+void Core_SetPowerSaving(bool mode) {
+	powerSaving = mode;
+}
+
+bool Core_GetPowerSaving() {
+	return powerSaving;
+}
+
+static bool IsWindowSmall(int pixelWidth, int pixelHeight) {
+	// Can't take this from config as it will not be set if windows is maximized.
+	int w = (int)(pixelWidth * g_dpi_scale_x);
+	int h = (int)(pixelHeight * g_dpi_scale_y);
+	return g_Config.IsPortrait() ? (h < 480 + 80) : (w < 480 + 80);
+}
+
+// TODO: Feels like this belongs elsewhere.
+bool UpdateScreenScale(int width, int height) {
+	bool smallWindow;
 #ifdef _WIN32
-	if (pixel_xres < 480 + 80) {
-		dp_xres *= 2;
-		dp_yres *= 2;
-		g_dpi_scale = 2.0f;
-	}
+	g_dpi = (float)System_GetPropertyInt(SYSPROP_DISPLAY_DPI);
+	g_dpi_scale_x = 96.0f / g_dpi;
+	g_dpi_scale_y = 96.0f / g_dpi;
+#else
+	g_dpi = 96.0f;
+	g_dpi_scale_x = 1.0f;
+	g_dpi_scale_y = 1.0f;
 #endif
-	pixel_in_dps = (float)pixel_xres / dp_xres;
-	NativeResized();
+	g_dpi_scale_real_x = g_dpi_scale_x;
+	g_dpi_scale_real_y = g_dpi_scale_y;
+
+	smallWindow = IsWindowSmall(width, height);
+	if (smallWindow) {
+		g_dpi /= 2.0f;
+		g_dpi_scale_x *= 2.0f;
+		g_dpi_scale_y *= 2.0f;
+	}
+	pixel_in_dps_x = 1.0f / g_dpi_scale_x;
+	pixel_in_dps_y = 1.0f / g_dpi_scale_y;
+
+	int new_dp_xres = width * g_dpi_scale_x;
+	int new_dp_yres = height * g_dpi_scale_y;
+
+	bool dp_changed = new_dp_xres != dp_xres || new_dp_yres != dp_yres;
+	bool px_changed = pixel_xres != width || pixel_yres != height;
+
+	if (dp_changed || px_changed) {
+		dp_xres = new_dp_xres;
+		dp_yres = new_dp_yres;
+		pixel_xres = width;
+		pixel_yres = height;
+		INFO_LOG(SYSTEM, "pixel_res: %dx%d. Calling NativeResized()", pixel_xres, pixel_yres);
+		NativeResized();
+		return true;
+	}
+	return false;
 }
 
 void UpdateRunLoop() {
@@ -139,37 +188,20 @@ void UpdateRunLoop() {
 		sleep_ms(16);
 		return;
 	}
-	NativeUpdate(input_state);
-
-	{
-		lock_guard guard(input_state.lock);
-		EndInputState(&input_state);
-	}
-
-	if (GetUIState() != UISTATE_EXIT) {
-		NativeRender();
-	}
+	NativeUpdate();
+	NativeRender(graphicsContext);
 }
 
-#if defined(USING_WIN_UI)
-
-void GPU_SwapBuffers() {
-	switch (g_Config.iGPUBackend) {
-	case GPU_BACKEND_OPENGL:
-		GL_SwapBuffers();
-		break;
-	case GPU_BACKEND_DIRECT3D9:
-		D3D9_SwapBuffers();
-		break;
-	}
-}
-
+void KeepScreenAwake() {
+#if defined(_WIN32) && !PPSSPP_PLATFORM(UWP)
+	SetThreadExecutionState(ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
 #endif
+}
 
-void Core_RunLoop() {
+void Core_RunLoop(GraphicsContext *ctx) {
+	graphicsContext = ctx;
 	while ((GetUIState() != UISTATE_INGAME || !PSP_IsInited()) && GetUIState() != UISTATE_EXIT) {
 		time_update();
-#if defined(USING_WIN_UI)
 		double startTime = time_now_d();
 		UpdateRunLoop();
 
@@ -178,33 +210,39 @@ void Core_RunLoop() {
 		double diffTime = time_now_d() - startTime;
 		int sleepTime = (int)(1000.0 / 60.0) - (int)(diffTime * 1000.0);
 		if (sleepTime > 0)
-			Sleep(sleepTime);
+			sleep_ms(sleepTime);
 		if (!windowHidden) {
-			GPU_SwapBuffers();
+			ctx->SwapBuffers();
 		}
-#else
-		UpdateRunLoop();
-#endif
 	}
 
 	while (!coreState && GetUIState() == UISTATE_INGAME) {
 		time_update();
 		UpdateRunLoop();
-#if defined(USING_WIN_UI)
 		if (!windowHidden && !Core_IsStepping()) {
-			GPU_SwapBuffers();
+			ctx->SwapBuffers();
+
+			// Keep the system awake for longer than normal for cutscenes and the like.
+			const double now = time_now_d();
+			if (now < lastActivity + ACTIVITY_IDLE_TIMEOUT) {
+				// Only resetting it ever prime number seconds in case the call is expensive.
+				// Using a prime number to ensure there's no interaction with other periodic events.
+				if (now - lastKeepAwake > 89.0 || now < lastKeepAwake) {
+					KeepScreenAwake();
+					lastKeepAwake = now;
+				}
+			}
 		}
-#endif
 	}
 }
 
 void Core_DoSingleStep() {
 	singleStepPending = true;
-	m_hStepEvent.notify_one();
+	m_StepCond.notify_one();
 }
 
 void Core_UpdateSingleStep() {
-	m_hStepEvent.notify_one();
+	m_StepCond.notify_one();
 }
 
 void Core_SingleStep() {
@@ -214,39 +252,30 @@ void Core_SingleStep() {
 static inline void CoreStateProcessed() {
 	if (coreStatePending) {
 		coreStatePending = false;
-		m_hInactiveEvent.notify_one();
+		m_InactiveCond.notify_one();
 	}
 }
 
-// Some platforms, like Android, do not call this function but handle things on their own.
-void Core_Run()
-{
-#if defined(_DEBUG)
+// Many platforms, like Android, do not call this function but handle things on their own.
+// Instead they simply call NativeRender and NativeUpdate directly.
+void Core_Run(GraphicsContext *ctx) {
 	host->UpdateDisassembly();
-#endif
-#if !defined(USING_QT_UI) || defined(MOBILE_DEVICE)
-	while (true)
-#endif
-	{
+	while (true) {
 reswitch:
 		if (GetUIState() != UISTATE_INGAME) {
 			CoreStateProcessed();
 			if (GetUIState() == UISTATE_EXIT) {
+				UpdateRunLoop();
 				return;
 			}
-			Core_RunLoop();
-#if defined(USING_QT_UI) && !defined(MOBILE_DEVICE)
-			return;
-#else
+			Core_RunLoop(ctx);
 			continue;
-#endif
 		}
 
-		switch (coreState)
-		{
+		switch (coreState) {
 		case CORE_RUNNING:
 			// enter a fast runloop
-			Core_RunLoop();
+			Core_RunLoop(ctx);
 			break;
 
 		// We should never get here on Android.
@@ -261,21 +290,16 @@ reswitch:
 			}
 
 			// wait for step command..
-#if defined(USING_QT_UI) || defined(_DEBUG)
 			host->UpdateDisassembly();
 			host->UpdateMemView();
 			host->SendCoreWait(true);
-#endif
 
-			m_hStepEvent.wait(m_hStepMutex);
+			{
+				std::unique_lock<std::mutex> guard(m_hStepMutex);
+				m_StepCond.wait(guard);
+			}
 
-#if defined(USING_QT_UI) || defined(_DEBUG)
 			host->SendCoreWait(false);
-#endif
-#if defined(USING_QT_UI) && !defined(MOBILE_DEVICE)
-			if (coreState != CORE_STEPPING)
-				return;
-#endif
 			// No step pending?  Let's go back to the wait.
 			if (!singleStepPending || coreState != CORE_STEPPING) {
 				if (coreState == CORE_POWERDOWN) {
@@ -286,10 +310,8 @@ reswitch:
 
 			Core_SingleStep();
 			// update disasm dialog
-#if defined(USING_QT_UI) || defined(_DEBUG)
 			host->UpdateDisassembly();
 			host->UpdateMemView();
-#endif
 			break;
 
 		case CORE_POWERUP:
@@ -304,24 +326,17 @@ reswitch:
 			return;
 		}
 	}
-
 }
-
 
 void Core_EnableStepping(bool step) {
 	if (step) {
 		sleep_ms(1);
-#if defined(_DEBUG)
 		host->SetDebugMode(true);
-#endif
-		m_hStepEvent.reset();
 		Core_UpdateState(CORE_STEPPING);
 	} else {
-#if defined(_DEBUG)
 		host->SetDebugMode(false);
-#endif
 		coreState = CORE_RUNNING;
 		coreStatePending = false;
-		m_hStepEvent.notify_one();
+		m_StepCond.notify_one();
 	}
 }

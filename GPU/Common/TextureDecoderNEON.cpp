@@ -15,37 +15,45 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include "ppsspp_config.h"
+
+#if PPSSPP_ARCH(ARM_NEON)
+
+#include "ext/xxhash.h"
+
 #include <arm_neon.h>
+
+#include "GPU/GPUState.h"
 #include "GPU/Common/TextureDecoder.h"
 
-#ifndef ARM
-#error Should not be compiled on non-ARM.
-#endif
+alignas(16) static const u16 QuickTexHashInitial[8] = {0xc00bU, 0x9bd9U, 0x4b73U, 0xb651U, 0x4d9bU, 0x4309U, 0x0083U, 0x0001U};
 
-static const u16 MEMORY_ALIGNED16(QuickTexHashInitial[8]) = {0x0001U, 0x0083U, 0x4309U, 0x4d9bU, 0xb651U, 0x4b73U, 0x9bd9U, 0xc00bU};
+#ifdef _MSC_VER
+#define __builtin_prefetch(a,b,c)
+#endif
 
 u32 QuickTexHashNEON(const void *checkp, u32 size) {
 	u32 check = 0;
 	__builtin_prefetch(checkp, 0, 0);
 
 	if (((intptr_t)checkp & 0xf) == 0 && (size & 0x3f) == 0) {
-#ifdef IOS
+#if defined(IOS) || PPSSPP_ARCH(ARM64) || defined(_MSC_VER)
 		uint32x4_t cursor = vdupq_n_u32(0);
-		uint32x4_t cursor2 = vld1q_u32((const u32 *)QuickTexHashInitial);
-		uint32x4_t update = vdupq_n_u32(0x24552455U);
+		uint16x8_t cursor2 = vld1q_u16(QuickTexHashInitial);
+		uint16x8_t update = vdupq_n_u16(0x2455U);
 
 		const u32 *p = (const u32 *)checkp;
 		for (u32 i = 0; i < size / 16; i += 4) {
-			cursor = vmlaq_u32(cursor, vld1q_u32(&p[4 * 0]), cursor2);
+			cursor = vreinterpretq_u32_u16(vmlaq_u16(vreinterpretq_u16_u32(cursor), vreinterpretq_u16_u32(vld1q_u32(&p[4 * 0])), cursor2));
 			cursor = veorq_u32(cursor, vld1q_u32(&p[4 * 1]));
 			cursor = vaddq_u32(cursor, vld1q_u32(&p[4 * 2]));
-			cursor = veorq_u32(cursor, vmulq_u32(vld1q_u32(&p[4 * 3]), cursor2));
-			cursor2 = vaddq_u32(cursor2, update);
+			cursor = veorq_u32(cursor, vreinterpretq_u32_u16(vmulq_u16(vreinterpretq_u16_u32(vld1q_u32(&p[4 * 3])), cursor2)));
+			cursor2 = vaddq_u16(cursor2, update);
 
 			p += 4 * 4;
 		}
 
-		cursor = vaddq_u32(cursor, cursor2);
+		cursor = vaddq_u32(cursor, vreinterpretq_u32_u16(cursor2));
 		check = vgetq_lane_u32(cursor, 0) + vgetq_lane_u32(cursor, 1) + vgetq_lane_u32(cursor, 2) + vgetq_lane_u32(cursor, 3);
 #else
 		// TODO: Why does this crash on iOS, but only certain devices?
@@ -60,15 +68,15 @@ u32 QuickTexHashNEON(const void *checkp, u32 size) {
 			"vmov.i32 q0, #0\n"
 
 			// Initialize cursor2.
-			"movw r0, 0x0001\n"
-			"movt r0, 0x0083\n"
-			"movw r1, 0x4309\n"
-			"movt r1, 0x4d9b\n"
+			"movw r0, 0xc00b\n"
+			"movt r0, 0x9bd9\n"
+			"movw r1, 0x4b73\n"
+			"movt r1, 0xb651\n"
 			"vmov d2, r0, r1\n"
-			"movw r0, 0xb651\n"
-			"movt r0, 0x4b73\n"
-			"movw r1, 0x9bd9\n"
-			"movt r1, 0xc00b\n"
+			"movw r0, 0x4d9b\n"
+			"movt r0, 0x4309\n"
+			"movw r1, 0x0083\n"
+			"movt r1, 0x0001\n"
 			"vmov d3, r0, r1\n"
 
 			// Initialize update.
@@ -82,12 +90,12 @@ u32 QuickTexHashNEON(const void *checkp, u32 size) {
 			"QuickTexHashNEON_next:\n"
 			"pld [%2, #0xc0]\n"
 			"vldmia %2!, {d16-d23}\n"
-			"vmla.i32 q0, q1, q8\n"
-			"vmul.i32 q11, q11, q1\n"
+			"vmla.i16 q0, q1, q8\n"
+			"vmul.i16 q11, q11, q1\n"
 			"veor.i32 q0, q0, q9\n"
 			"cmp %2, r0\n"
 			"vadd.i32 q0, q0, q10\n"
-			"vadd.i32 q1, q1, q2\n"
+			"vadd.i16 q1, q1, q2\n"
 			"veor.i32 q0, q0, q11\n"
 			"blo QuickTexHashNEON_next\n"
 
@@ -116,7 +124,10 @@ u32 QuickTexHashNEON(const void *checkp, u32 size) {
 	return check;
 }
 
-void DoUnswizzleTex16NEON(const u8 *texptr, u32 *ydestp, int bxc, int byc, u32 pitch, u32 rowWidth) {
+void DoUnswizzleTex16NEON(const u8 *texptr, u32 *ydestp, int bxc, int byc, u32 pitch) {
+	// ydestp is in 32-bits, so this is convenient.
+	const u32 pitchBy32 = pitch >> 2;
+
 	__builtin_prefetch(texptr, 0, 0);
 	__builtin_prefetch(ydestp, 1, 1);
 
@@ -132,18 +143,18 @@ void DoUnswizzleTex16NEON(const u8 *texptr, u32 *ydestp, int bxc, int byc, u32 p
 				uint32x4_t temp3 = vld1q_u32(src + 8);
 				uint32x4_t temp4 = vld1q_u32(src + 12);
 				vst1q_u32(dest, temp1);
-				dest += pitch;
+				dest += pitchBy32;
 				vst1q_u32(dest, temp2);
-				dest += pitch;
+				dest += pitchBy32;
 				vst1q_u32(dest, temp3);
-				dest += pitch;
+				dest += pitchBy32;
 				vst1q_u32(dest, temp4);
-				dest += pitch;
+				dest += pitchBy32;
 				src += 16;
 			}
 			xdest += 4;
 		}
-		ydestp += (rowWidth * 8) / 4;
+		ydestp += pitchBy32 * 8;
 	}
 }
 
@@ -177,7 +188,12 @@ void DoUnswizzleTex16NEON(const u8 *texptr, u32 *ydestp, int bxc, int byc, u32 p
 #  define XXH_rotl32(x,r) ((x << r) | (x >> (32 - r)))
 #endif
 
-u32 ReliableHashNEON(const void *input, int len, u32 seed) {
+u32 ReliableHash32NEON(const void *input, size_t len, u32 seed) {
+	if (((uintptr_t)input & 3) != 0) {
+		// Cannot handle misaligned data. Fall back to XXH32.
+		return XXH32(input, len, seed);
+	}
+
 	const u8 *p = (const u8 *)input;
 	const u8 *const bEnd = p + len;
 	U32 h32;
@@ -198,8 +214,7 @@ u32 ReliableHashNEON(const void *input, int len, u32 seed) {
 		uint32x4_t prime32_2q = vdupq_n_u32(PRIME32_2);
 		uint32x4_t vq = vcombine_u32(vcreate_u32(v1 | ((U64)v2 << 32)), vcreate_u32(v3 | ((U64)v4 << 32)));
 
-		do
-		{
+		do {
 			__builtin_prefetch(p + 0xc0, 0, 0);
 			vq = vmlaq_u32(vq, vld1q_u32((const U32*)p), prime32_2q);
 			vq = vorrq_u32(vshlq_n_u32(vq, 13), vshrq_n_u32(vq, 32 - 13));
@@ -243,3 +258,132 @@ u32 ReliableHashNEON(const void *input, int len, u32 seed) {
 
 	return h32;
 }
+
+static inline bool VectorIsNonZeroNEON(const uint32x4_t &v) {
+	u64 low = vgetq_lane_u64(vreinterpretq_u64_u32(v), 0);
+	u64 high = vgetq_lane_u64(vreinterpretq_u64_u32(v), 1);
+
+	return (low | high) != 0;
+}
+
+#ifndef _MSC_VER
+// MSVC consider this function the same as the one above! uint16x8_t is typedef'd to the same type as uint32x4_t.
+static inline bool VectorIsNonZeroNEON(const uint16x8_t &v) {
+	u64 low = vgetq_lane_u64(vreinterpretq_u64_u16(v), 0);
+	u64 high = vgetq_lane_u64(vreinterpretq_u64_u16(v), 1);
+
+	return (low | high) != 0;
+}
+#endif
+
+CheckAlphaResult CheckAlphaRGBA8888NEON(const u32 *pixelData, int stride, int w, int h) {
+	const u32 *p = (const u32 *)pixelData;
+
+	const uint32x4_t mask = vdupq_n_u32(0xFF000000);
+	uint32x4_t bits = mask;
+	for (int y = 0; y < h; ++y) {
+		for (int i = 0; i < w; i += 4) {
+			const uint32x4_t a = vld1q_u32(&p[i]);
+			bits = vandq_u32(bits, a);
+		}
+
+		uint32x4_t result = veorq_u32(bits, mask);
+		if (VectorIsNonZeroNEON(result)) {
+			return CHECKALPHA_ANY;
+		}
+
+		p += stride;
+	}
+
+	return CHECKALPHA_FULL;
+}
+
+CheckAlphaResult CheckAlphaABGR4444NEON(const u32 *pixelData, int stride, int w, int h) {
+	const u16 *p = (const u16 *)pixelData;
+
+	const uint16x8_t mask = vdupq_n_u16((u16)0x000F);
+	uint16x8_t bits = mask;
+	for (int y = 0; y < h; ++y) {
+		for (int i = 0; i < w; i += 8) {
+			const uint16x8_t a = vld1q_u16(&p[i]);
+			bits = vandq_u16(bits, a);
+		}
+
+		uint16x8_t result = veorq_u16(bits, mask);
+		if (VectorIsNonZeroNEON(result)) {
+			return CHECKALPHA_ANY;
+		}
+
+		p += stride;
+	}
+
+	return CHECKALPHA_FULL;
+}
+
+CheckAlphaResult CheckAlphaABGR1555NEON(const u32 *pixelData, int stride, int w, int h) {
+	const u16 *p = (const u16 *)pixelData;
+
+	const uint16x8_t mask = vdupq_n_u16((u16)0x0001);
+	uint16x8_t bits = mask;
+	for (int y = 0; y < h; ++y) {
+		for (int i = 0; i < w; i += 8) {
+			const uint16x8_t a = vld1q_u16(&p[i]);
+			bits = vandq_u16(bits, a);
+		}
+
+		uint16x8_t result = veorq_u16(bits, mask);
+		if (VectorIsNonZeroNEON(result)) {
+			return CHECKALPHA_ANY;
+		}
+
+		p += stride;
+	}
+
+	return CHECKALPHA_FULL;
+}
+
+CheckAlphaResult CheckAlphaRGBA4444NEON(const u32 *pixelData, int stride, int w, int h) {
+	const u16 *p = (const u16 *)pixelData;
+
+	const uint16x8_t mask = vdupq_n_u16((u16)0xF000);
+	uint16x8_t bits = mask;
+	for (int y = 0; y < h; ++y) {
+		for (int i = 0; i < w; i += 8) {
+			const uint16x8_t a = vld1q_u16(&p[i]);
+			bits = vandq_u16(bits, a);
+		}
+
+		uint16x8_t result = veorq_u16(bits, mask);
+		if (VectorIsNonZeroNEON(result)) {
+			return CHECKALPHA_ANY;
+		}
+
+		p += stride;
+	}
+
+	return CHECKALPHA_FULL;
+}
+
+CheckAlphaResult CheckAlphaRGBA5551NEON(const u32 *pixelData, int stride, int w, int h) {
+	const u16 *p = (const u16 *)pixelData;
+
+	const uint16x8_t mask = vdupq_n_u16((u16)0x8000);
+	uint16x8_t bits = mask;
+	for (int y = 0; y < h; ++y) {
+		for (int i = 0; i < w; i += 8) {
+			const uint16x8_t a = vld1q_u16(&p[i]);
+			bits = vandq_u16(bits, a);
+		}
+
+		uint16x8_t result = veorq_u16(bits, mask);
+		if (VectorIsNonZeroNEON(result)) {
+			return CHECKALPHA_ANY;
+		}
+
+		p += stride;
+	}
+
+	return CHECKALPHA_FULL;
+}
+
+#endif

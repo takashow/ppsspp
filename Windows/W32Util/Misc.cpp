@@ -1,9 +1,21 @@
 #include "stdafx.h"
+#include "ppsspp_config.h"
+#include "CommonWindows.h"
+
 #include <WinUser.h>
 #include <shellapi.h>
+#include <commctrl.h>
+
 #include "Misc.h"
 #include "util/text/utf8.h"
-#include <commctrl.h>
+
+bool KeyDownAsync(int vkey) {
+#if PPSSPP_PLATFORM(UWP)
+	return 0;
+#else
+	return (GetAsyncKeyState(vkey) & 0x8000) != 0;
+#endif
+}
 
 namespace W32Util
 {
@@ -55,9 +67,9 @@ namespace W32Util
 		}
 		float f = (float)size + ((float)frac / 1024.0f);
 		if (s==0)
-			sprintf(out,"%d B",size);
+			sprintf(out, "%d B", (int)size);
 		else
-			sprintf(out,"%3.1f %s",f,sizes[s]);
+			sprintf(out, "%3.1f %s", f, sizes[s]);
 	}
 
 	BOOL CopyTextToClipboard(HWND hwnd, const char *text) {

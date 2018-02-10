@@ -17,8 +17,9 @@
 
 #pragma once
 
-#include "native/thread/thread.h"
-#include "native/base/mutex.h"
+#include <thread>
+#include <mutex>
+
 #include "Core/Dialog/PSPDialog.h"
 #include "Core/Dialog/SavedataParam.h"
 
@@ -33,6 +34,7 @@
 #define SCE_UTILITY_SAVEDATA_ERROR_LOAD_INTERNAL        (0x8011030b)
 
 #define SCE_UTILITY_SAVEDATA_ERROR_RW_NO_MEMSTICK       (0x80110321)
+#define SCE_UTILITY_SAVEDATA_ERROR_RW_MEMSTICK_FULL     (0x80110323)
 #define SCE_UTILITY_SAVEDATA_ERROR_RW_DATA_BROKEN       (0x80110326)
 #define SCE_UTILITY_SAVEDATA_ERROR_RW_NO_DATA           (0x80110327)
 #define SCE_UTILITY_SAVEDATA_ERROR_RW_BAD_PARAMS        (0x80110328)
@@ -72,15 +74,15 @@ public:
 	virtual ~PSPSaveDialog();
 
 	virtual int Init(int paramAddr);
-	virtual int Update(int animSpeed);
-	virtual int Shutdown(bool force = false);
-	virtual void DoState(PointerWrap &p);
-	virtual pspUtilityDialogCommon *GetCommonParam();
+	virtual int Update(int animSpeed) override;
+	virtual int Shutdown(bool force = false) override;
+	virtual void DoState(PointerWrap &p) override;
+	virtual pspUtilityDialogCommon *GetCommonParam() override;
 
 	void ExecuteIOAction();
 
 protected:
-	virtual bool UseAutoStatus() {
+	virtual bool UseAutoStatus() override {
 		return false;
 	}
 
@@ -89,9 +91,8 @@ private:
 	void DisplayBanner(int which);
 	void DisplaySaveList(bool canMove = true);
 	void DisplaySaveIcon();
-	void DisplayTitle(std::string name);
 	void DisplaySaveDataInfo1();
-	void DisplaySaveDataInfo2();
+	void DisplaySaveDataInfo2(bool showNewData = false);
 	void DisplayMessage(std::string text, bool hasYesNo = false);
 	const std::string GetSelectedSaveDirName() const;
 
@@ -153,7 +154,7 @@ private:
 	};
 
 	std::thread *ioThread;
-	recursive_mutex paramLock;
+	std::mutex paramLock;
 	volatile SaveIOStatus ioThreadStatus;
 };
 

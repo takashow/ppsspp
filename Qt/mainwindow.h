@@ -1,5 +1,7 @@
-#ifndef MAINWINDOW_H
-#define MAINWINDOW_H
+#pragma once
+
+#include <queue>
+#include <mutex>
 
 #include <QtCore>
 #include <QMenuBar>
@@ -14,19 +16,24 @@
 #include "Debugger/debugger_memory.h"
 #include "Debugger/debugger_memorytex.h"
 #include "Debugger/debugger_displaylist.h"
-#include "base/QtMain.h"
+#include "Qt/QtMain.h"
 
 extern bool g_TakeScreenshot;
 
 class MenuAction;
 class MenuTree;
 
+// hacky, should probably use qt signals or something, but whatever..
+enum class MainWindowMsg {
+	BOOT_DONE
+};
+
 class MainWindow : public QMainWindow
 {
 	Q_OBJECT
 
 public:
-	explicit MainWindow(QWidget *parent = 0);
+	explicit MainWindow(QWidget *parent = 0, bool fullscreen=false);
 	~MainWindow() { };
 
 	Debugger_Disasm* GetDialogDisasm() { return dialogDisasm; }
@@ -37,6 +44,11 @@ public:
 
 	void ShowMemory(u32 addr);
 	void updateMenus();
+
+	void Notify(MainWindowMsg msg) {
+		std::unique_lock<std::mutex> lock(msgMutex_);
+		msgQueue_.push(msg);
+	}
 
 protected:
 	void changeEvent(QEvent *e)
@@ -54,7 +66,6 @@ signals:
 	void updateMenu();
 
 public slots:
-	void Boot();
 	void newFrame();
 
 private slots:
@@ -87,7 +98,6 @@ private slots:
 
 	// Options
 	// Core
-	void dynarecAct() { g_Config.bJit = !g_Config.bJit; }
 	void vertexDynarecAct() { g_Config.bVertexDecoderJit = !g_Config.bVertexDecoderJit; }
 	void fastmemAct() { g_Config.bFastMemory = !g_Config.bFastMemory; }
 	void ignoreIllegalAct() { g_Config.bIgnoreBadMemAccess = !g_Config.bIgnoreBadMemAccess; }
@@ -98,9 +108,9 @@ private slots:
 	void bufferRenderAct() { g_Config.iRenderingMode = !g_Config.iRenderingMode; }
 	void linearAct() { g_Config.iTexFiltering = (g_Config.iTexFiltering != 0) ? 0 : 3; }
 
-	void screenGroup_triggered(QAction *action) { SetZoom(action->data().toInt()); }
+	void screenGroup_triggered(QAction *action) { SetWindowScale(action->data().toInt()); }
 
-	void stretchAct();
+	void displayLayoutGroup_triggered(QAction *action) { g_Config.iSmallDisplayZoomType = action->data().toInt(); }
 	void transformAct() { g_Config.bHardwareTransform = !g_Config.bHardwareTransform; }
 	void vertexCacheAct() { g_Config.bVertexCache = !g_Config.bVertexCache; }
 	void frameskipAct() { g_Config.iFrameSkip = !g_Config.iFrameSkip; }
@@ -109,6 +119,7 @@ private slots:
 	void audioAct() { g_Config.bEnableSound = !g_Config.bEnableSound; }
 
 	void fullscrAct();
+	void raiseTopMost();
 	void statsAct() { g_Config.bShowDebugStats = !g_Config.bShowDebugStats; }
 	void showFPSAct() { g_Config.iShowFPSCounter = !g_Config.iShowFPSCounter; }
 
@@ -129,13 +140,15 @@ private slots:
 	// Help
 	void websiteAct();
 	void forumAct();
+	void gitAct();
 	void aboutAct();
 
 	// Others
 	void langChanged(QAction *action) { loadLanguage(action->data().toString(), true); }
 
 private:
-	void SetZoom(int zoom);
+	void bootDone();
+	void SetWindowScale(int zoom);
 	void SetGameTitle(QString text);
 	void loadLanguage(const QString &language, bool retranslate);
 	void createMenus();
@@ -145,7 +158,6 @@ private:
 	QString currentLanguage;
 
 	CoreState nextState;
-	InputState input_state;
 	GlobalUIState lastUIState;
 
 	Debugger_Disasm *dialogDisasm;
@@ -153,8 +165,11 @@ private:
 	Debugger_MemoryTex *memoryTexWindow;
 	Debugger_DisplayList *displaylistWindow;
 
-	QActionGroup *anisotropicGroup, *screenGroup,
+	QActionGroup *anisotropicGroup, *screenGroup, *displayLayoutGroup,
 	             *defaultLogGroup, *g3dLogGroup, *hleLogGroup;
+
+	std::queue<MainWindowMsg> msgQueue_;
+	std::mutex msgMutex_;
 };
 
 class MenuAction : public QAction
@@ -275,5 +290,3 @@ public slots:
 private:
 	const char *_text;
 };
-
-#endif // MAINWINDOW_H

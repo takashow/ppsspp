@@ -15,12 +15,15 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include <algorithm>
 #include <vector>
+#include <thread>
+#include <mutex>
 
 #include "base/timeutil.h"
 #include "i18n/i18n.h"
+#include "thread/threadutil.h"
 
-#include "Common/StdMutex.h"
 #include "Common/FileUtil.h"
 #include "Common/ChunkFile.h"
 
@@ -29,6 +32,7 @@
 #include "Core/Core.h"
 #include "Core/CoreTiming.h"
 #include "Core/Host.h"
+#include "Core/Screenshot.h"
 #include "Core/System.h"
 #include "Core/FileSystems/MetaFileSystem.h"
 #include "Core/ELF/ParamSFO.h"
@@ -38,10 +42,14 @@
 #include "Core/HLE/sceKernel.h"
 #include "Core/MemMap.h"
 #include "Core/MIPS/MIPS.h"
-#include "Core/MIPS/JitCommon/JitCommon.h"
+#include "Core/MIPS/JitCommon/JitBlockCache.h"
 #include "HW/MemoryStick.h"
 #include "GPU/GPUState.h"
-#include "UI/OnScreenDisplay.h"
+
+#ifndef MOBILE_DEVICE
+#include "Core/AVIDump.h"
+#include "Core/HLE/__sceAudio.h"
+#endif
 
 namespace SaveState
 {
@@ -56,6 +64,7 @@ namespace SaveState
 		SAVESTATE_LOAD,
 		SAVESTATE_VERIFY,
 		SAVESTATE_REWIND,
+		SAVESTATE_SAVE_SCREENSHOT,
 	};
 
 	struct Operation
@@ -94,6 +103,8 @@ namespace SaveState
 
 		CChunkFileReader::Error Save()
 		{
+			std::lock_guard<std::mutex> guard(lock_);
+
 			int n = next_++ % size_;
 			if ((next_ % size_) == first_)
 				++first_;
@@ -114,7 +125,7 @@ namespace SaveState
 				err = SaveToRam(buffer);
 
 			if (err == CChunkFileReader::ERROR_NONE)
-				Compress(states_[n], *compressBuffer, bases_[base_]);
+				ScheduleCompress(&states_[n], compressBuffer, &bases_[base_]);
 			else
 				states_[n].clear();
 			baseMapping_[n] = base_;
@@ -123,6 +134,8 @@ namespace SaveState
 
 		CChunkFileReader::Error Restore()
 		{
+			std::lock_guard<std::mutex> guard(lock_);
+
 			// No valid states left.
 			if (Empty())
 				return CChunkFileReader::ERROR_BAD_FILE;
@@ -132,12 +145,26 @@ namespace SaveState
 				return CChunkFileReader::ERROR_BAD_FILE;
 
 			static std::vector<u8> buffer;
-			Decompress(buffer, states_[n], bases_[baseMapping_[n]]);
+			LockedDecompress(buffer, states_[n], bases_[baseMapping_[n]]);
 			return LoadFromRam(buffer);
+		}
+
+		void ScheduleCompress(std::vector<u8> *result, const std::vector<u8> *state, const std::vector<u8> *base)
+		{
+			auto th = new std::thread([=]{
+				setCurrentThreadName("SaveStateCompress");
+				Compress(*result, *state, *base);
+			});
+			th->detach();
 		}
 
 		void Compress(std::vector<u8> &result, const std::vector<u8> &state, const std::vector<u8> &base)
 		{
+			std::lock_guard<std::mutex> guard(lock_);
+			// Bail if we were cleared before locking.
+			if (first_ == 0 && next_ == 0)
+				return;
+
 			result.clear();
 			for (size_t i = 0; i < state.size(); i += BLOCK_SIZE)
 			{
@@ -152,7 +179,7 @@ namespace SaveState
 			}
 		}
 
-		void Decompress(std::vector<u8> &result, const std::vector<u8> &compressed, const std::vector<u8> &base)
+		void LockedDecompress(std::vector<u8> &result, const std::vector<u8> &compressed, const std::vector<u8> &base)
 		{
 			result.clear();
 			result.reserve(base.size());
@@ -179,11 +206,13 @@ namespace SaveState
 
 		void Clear()
 		{
+			// This lock is mainly for shutdown.
+			std::lock_guard<std::mutex> guard(lock_);
 			first_ = 0;
 			next_ = 0;
 		}
 
-		bool Empty()
+		bool Empty() const
 		{
 			return next_ == first_;
 		}
@@ -191,20 +220,25 @@ namespace SaveState
 		static const int BLOCK_SIZE;
 		// TODO: Instead, based on size of compressed state?
 		static const int BASE_USAGE_INTERVAL;
+
 		typedef std::vector<u8> StateBuffer;
+
 		int first_;
 		int next_;
 		int size_;
+
 		std::vector<StateBuffer> states_;
 		StateBuffer bases_[2];
 		std::vector<int> baseMapping_;
+		std::mutex lock_;
+
 		int base_;
 		int baseUsage_;
 	};
 
 	static bool needsProcess = false;
 	static std::vector<Operation> pending;
-	static std::recursive_mutex mutex;
+	static std::mutex mutex;
 	static bool hasLoadedState = false;
 
 	// TODO: Should this be configurable?
@@ -229,10 +263,10 @@ namespace SaveState
 		auto savedReplacements = SaveAndClearReplacements();
 		if (MIPSComp::jit && p.mode == p.MODE_WRITE)
 		{
-			auto blockCache = MIPSComp::jit->GetBlockCache();
-			auto savedBlocks = blockCache->SaveAndClearEmuHackOps();
+			std::vector<u32> savedBlocks;
+			savedBlocks = MIPSComp::jit->SaveAndClearEmuHackOps();
 			Memory::DoState(p);
-			blockCache->RestoreSavedEmuHackOps(savedBlocks);
+			MIPSComp::jit->RestoreSavedEmuHackOps(savedBlocks);
 		}
 		else
 			Memory::DoState(p);
@@ -248,7 +282,7 @@ namespace SaveState
 
 	void Enqueue(SaveState::Operation op)
 	{
-		std::lock_guard<std::recursive_mutex> guard(mutex);
+		std::lock_guard<std::mutex> guard(mutex);
 		pending.push_back(op);
 
 		// Don't actually run it until next frame.
@@ -277,75 +311,137 @@ namespace SaveState
 		Enqueue(Operation(SAVESTATE_REWIND, std::string(""), callback, cbUserData));
 	}
 
+	void SaveScreenshot(const std::string &filename, Callback callback, void *cbUserData)
+	{
+		Enqueue(Operation(SAVESTATE_SAVE_SCREENSHOT, filename, callback, cbUserData));
+	}
+
 	bool CanRewind()
 	{
 		return !rewindStates.Empty();
 	}
 
-	static const char *STATE_EXTENSION = "ppst";
-	static const char *SCREENSHOT_EXTENSION = "jpg";
 	// Slot utilities
 
-	std::string GenerateSaveSlotFilename(int slot, const char *extension)
+	std::string AppendSlotTitle(const std::string &filename, const std::string &title) {
+		if (!endsWith(filename, std::string(".") + STATE_EXTENSION)) {
+			return title + " (" + filename + ")";
+		}
+
+		// Usually these are slots, let's check the slot # after the last '_'.
+		size_t slotNumPos = filename.find_last_of('_');
+		if (slotNumPos == filename.npos) {
+			return title + " (" + filename + ")";
+		}
+
+		const size_t extLength = strlen(STATE_EXTENSION) + 1;
+		// If we take out the extension, '_', etc. we should be left with only a single digit.
+		if (slotNumPos + 1 + extLength != filename.length() - 1) {
+			return title + " (" + filename + ")";
+		}
+
+		std::string slot = filename.substr(slotNumPos + 1, 1);
+		if (slot[0] < '0' || slot[0] > '8') {
+			return title + " (" + filename + ")";
+		}
+
+		// Change from zero indexed to human friendly.
+		slot[0]++;
+		return title + " (" + slot + ")";
+	}
+
+	std::string GetTitle(const std::string &filename) {
+		std::string title;
+		if (CChunkFileReader::GetFileTitle(filename, &title) == CChunkFileReader::ERROR_NONE) {
+			if (title.empty()) {
+				return File::GetFilename(filename);
+			}
+
+			return AppendSlotTitle(filename, title);
+		}
+
+		// The file can't be loaded - let's note that.
+		I18NCategory *sy = GetI18NCategory("System");
+		return File::GetFilename(filename) + " " + sy->T("(broken)");
+	}
+
+	std::string GenerateSaveSlotFilename(const std::string &gameFilename, int slot, const char *extension)
 	{
-		char discID[256];
-		char temp[2048];
-		snprintf(discID, sizeof(discID), "%s_%s",
-			g_paramSFO.GetValueString("DISC_ID").c_str(),
-			g_paramSFO.GetValueString("DISC_VERSION").c_str());
-		snprintf(temp, sizeof(temp), "ms0:/PSP/PPSSPP_STATE/%s_%i.%s", discID, slot, extension);
+		std::string discId = g_paramSFO.GetValueString("DISC_ID");
+		std::string discVer = g_paramSFO.GetValueString("DISC_VERSION");
+		std::string fullDiscId;
+		if (discId.empty()) {
+			discId = g_paramSFO.GenerateFakeID();
+			discVer = "1.00";
+		}
+		fullDiscId = StringFromFormat("%s_%s", discId.c_str(), discVer.c_str());
+
+		std::string temp = StringFromFormat("ms0:/PSP/PPSSPP_STATE/%s_%d.%s", fullDiscId.c_str(), slot, extension);
 		std::string hostPath;
-		if (pspFileSystem.GetHostPath(std::string(temp), hostPath)) {
+		if (pspFileSystem.GetHostPath(temp, hostPath)) {
 			return hostPath;
 		} else {
 			return "";
 		}
 	}
 
-	void NextSlot()
+	int GetCurrentSlot()
 	{
-		I18NCategory *sy = GetI18NCategory("System");
-		g_Config.iCurrentStateSlot = (g_Config.iCurrentStateSlot + 1) % SaveState::SAVESTATESLOTS;
-		char msg[128];
-		snprintf(msg, sizeof(msg), "%s: %d", sy->T("Savestate Slot"), g_Config.iCurrentStateSlot + 1);
-		osm.Show(msg);
+		return g_Config.iCurrentStateSlot;
 	}
 
-	void LoadSlot(int slot, Callback callback, void *cbUserData)
+	void NextSlot()
 	{
-		std::string fn = GenerateSaveSlotFilename(slot, STATE_EXTENSION);
+		g_Config.iCurrentStateSlot = (g_Config.iCurrentStateSlot + 1) % NUM_SLOTS;
+	}
+
+	void LoadSlot(const std::string &gameFilename, int slot, Callback callback, void *cbUserData)
+	{
+		std::string fn = GenerateSaveSlotFilename(gameFilename, slot, STATE_EXTENSION);
 		if (!fn.empty()) {
 			Load(fn, callback, cbUserData);
 		} else {
-			I18NCategory *s = GetI18NCategory("Screen");
-			osm.Show("Failed to load state. Error in the file system.", 2.0);
+			I18NCategory *sy = GetI18NCategory("System");
 			if (callback)
-				(*callback)(false, cbUserData);
+				callback(false, sy->T("Failed to load state. Error in the file system."), cbUserData);
 		}
 	}
 
-	void SaveSlot(int slot, Callback callback, void *cbUserData)
+	void SaveSlot(const std::string &gameFilename, int slot, Callback callback, void *cbUserData)
 	{
-		std::string fn = GenerateSaveSlotFilename(slot, STATE_EXTENSION);
+		std::string fn = GenerateSaveSlotFilename(gameFilename, slot, STATE_EXTENSION);
+		std::string shot = GenerateSaveSlotFilename(gameFilename, slot, SCREENSHOT_EXTENSION);
 		if (!fn.empty()) {
-			Save(fn, callback, cbUserData);
+			auto renameCallback = [=](bool status, const std::string &message, void *data) {
+				if (status) {
+					if (File::Exists(fn)) {
+						File::Delete(fn);
+					}
+					File::Rename(fn + ".tmp", fn);
+				}
+				if (callback) {
+					callback(status, message, data);
+				}
+			};
+			// Let's also create a screenshot.
+			SaveScreenshot(shot, Callback(), 0);
+			Save(fn + ".tmp", renameCallback, cbUserData);
 		} else {
-			I18NCategory *s = GetI18NCategory("Screen");
-			osm.Show("Failed to save state. Error in the file system.", 2.0);
+			I18NCategory *sy = GetI18NCategory("System");
 			if (callback)
-				(*callback)(false, cbUserData);
+				callback(false, sy->T("Failed to save state. Error in the file system."), cbUserData);
 		}
 	}
 
-	bool HasSaveInSlot(int slot)
+	bool HasSaveInSlot(const std::string &gameFilename, int slot)
 	{
-		std::string fn = GenerateSaveSlotFilename(slot, STATE_EXTENSION);
+		std::string fn = GenerateSaveSlotFilename(gameFilename, slot, STATE_EXTENSION);
 		return File::Exists(fn);
 	}
 
-	bool HasScreenshotInSlot(int slot)
+	bool HasScreenshotInSlot(const std::string &gameFilename, int slot)
 	{
-		std::string fn = GenerateSaveSlotFilename(slot, SCREENSHOT_EXTENSION);
+		std::string fn = GenerateSaveSlotFilename(gameFilename, slot, SCREENSHOT_EXTENSION);
 		return File::Exists(fn);
 	}
 
@@ -365,14 +461,15 @@ namespace SaveState
 		return false;
 	}
 
-	int GetNewestSlot() {
+	int GetNewestSlot(const std::string &gameFilename) {
 		int newestSlot = -1;
 		tm newestDate = {0};
-		for (int i = 0; i < SAVESTATESLOTS; i++) {
-			std::string fn = GenerateSaveSlotFilename(i, STATE_EXTENSION);
+		for (int i = 0; i < NUM_SLOTS; i++) {
+			std::string fn = GenerateSaveSlotFilename(gameFilename, i, STATE_EXTENSION);
 			if (File::Exists(fn)) {
-				tm time = File::GetModifTime(fn);
-				if (newestDate < time) {
+				tm time;
+				bool success = File::GetModifTime(fn, time);
+				if (success && newestDate < time) {
 					newestDate = time;
 					newestSlot = i;
 				}
@@ -381,10 +478,23 @@ namespace SaveState
 		return newestSlot;
 	}
 
+	std::string GetSlotDateAsString(const std::string &gameFilename, int slot) {
+		std::string fn = GenerateSaveSlotFilename(gameFilename, slot, STATE_EXTENSION);
+		if (File::Exists(fn)) {
+			tm time;
+			if (File::GetModifTime(fn, time)) {
+				char buf[256];
+				// TODO: Use local time format? Americans and some others might not like ISO standard :)
+				strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &time);
+				return std::string(buf);
+			}
+		}
+		return "";
+	}
 
 	std::vector<Operation> Flush()
 	{
-		std::lock_guard<std::recursive_mutex> guard(mutex);
+		std::lock_guard<std::mutex> guard(mutex);
 		std::vector<Operation> copy = pending;
 		pending.clear();
 
@@ -419,6 +529,7 @@ namespace SaveState
 		return false;
 	}
 
+#ifndef MOBILE_DEVICE
 	static inline void CheckRewindState()
 	{
 		if (gpuStats.numFlips % g_Config.iRewindFlipFrequency != 0)
@@ -434,6 +545,7 @@ namespace SaveState
 		DEBUG_LOG(BOOT, "saving rewind state");
 		rewindStates.Save();
 	}
+#endif
 
 	bool HasLoadedState()
 	{
@@ -453,7 +565,7 @@ namespace SaveState
 
 		if (!__KernelIsRunning())
 		{
-			ERROR_LOG(COMMON, "Savestate failure: Unable to load without kernel, this should never happen.");
+			ERROR_LOG(SAVESTATE, "Savestate failure: Unable to load without kernel, this should never happen.");
 			return;
 		}
 
@@ -465,91 +577,132 @@ namespace SaveState
 			Operation &op = operations[i];
 			CChunkFileReader::Error result;
 			bool callbackResult;
+			std::string callbackMessage;
 			std::string reason;
+			std::string title;
 
-			I18NCategory *s = GetI18NCategory("Screen");
-			// I couldn't stand the inconsistency.  But trying not to break old lang files.
-			const char *i18nLoadFailure = s->T("Load savestate failed", "");
-			const char *i18nSaveFailure = s->T("Save State Failed", "");
+			I18NCategory *sc = GetI18NCategory("Screen");
+			const char *i18nLoadFailure = sc->T("Load savestate failed", "");
+			const char *i18nSaveFailure = sc->T("Save State Failed", "");
 			if (strlen(i18nLoadFailure) == 0)
-				i18nLoadFailure = s->T("Failed to load state");
+				i18nLoadFailure = sc->T("Failed to load state");
 			if (strlen(i18nSaveFailure) == 0)
-				i18nSaveFailure = s->T("Failed to save state");
+				i18nSaveFailure = sc->T("Failed to save state");
 
 			switch (op.type)
 			{
 			case SAVESTATE_LOAD:
-				INFO_LOG(COMMON, "Loading state from %s", op.filename.c_str());
-				result = CChunkFileReader::Load(op.filename, REVISION, PPSSPP_GIT_VERSION, state, &reason);
+				INFO_LOG(SAVESTATE, "Loading state from %s", op.filename.c_str());
+				result = CChunkFileReader::Load(op.filename, PPSSPP_GIT_VERSION, state, &reason);
 				if (result == CChunkFileReader::ERROR_NONE) {
-					osm.Show(s->T("Loaded State"), 2.0);
+					callbackMessage = sc->T("Loaded State");
 					callbackResult = true;
 					hasLoadedState = true;
+#ifndef MOBILE_DEVICE
+					if (g_Config.bSaveLoadResetsAVdumping) {
+						if (g_Config.bDumpFrames) {
+							AVIDump::Stop();
+							AVIDump::Start(PSP_CoreParameter().renderWidth, PSP_CoreParameter().renderHeight);
+						}
+						if (g_Config.bDumpAudio) {
+							WAVDump::Reset();
+						}
+					}
+#endif
 				} else if (result == CChunkFileReader::ERROR_BROKEN_STATE) {
 					HandleFailure();
-					osm.Show(i18nLoadFailure, 2.0);
-					ERROR_LOG(COMMON, "Load state failure: %s", reason.c_str());
+					callbackMessage = i18nLoadFailure;
+					ERROR_LOG(SAVESTATE, "Load state failure: %s", reason.c_str());
 					callbackResult = false;
 				} else {
-					osm.Show(s->T(reason.c_str(), i18nLoadFailure), 2.0);
+					callbackMessage = sc->T(reason.c_str(), i18nLoadFailure);
 					callbackResult = false;
 				}
 				break;
 
 			case SAVESTATE_SAVE:
-				INFO_LOG(COMMON, "Saving state to %s", op.filename.c_str());
-				result = CChunkFileReader::Save(op.filename, REVISION, PPSSPP_GIT_VERSION, state);
+				INFO_LOG(SAVESTATE, "Saving state to %s", op.filename.c_str());
+				title = g_paramSFO.GetValueString("TITLE");
+				if (title.empty()) {
+					// Homebrew title
+					title = PSP_CoreParameter().fileToStart;
+					std::size_t lslash = title.find_last_of("/");
+					title = title.substr(lslash + 1);
+				}
+				result = CChunkFileReader::Save(op.filename, title, PPSSPP_GIT_VERSION, state);
 				if (result == CChunkFileReader::ERROR_NONE) {
-					osm.Show(s->T("Saved State"), 2.0);
+					callbackMessage = sc->T("Saved State");
 					callbackResult = true;
+#ifndef MOBILE_DEVICE
+					if (g_Config.bSaveLoadResetsAVdumping) {
+						if (g_Config.bDumpFrames) {
+							AVIDump::Stop();
+							AVIDump::Start(PSP_CoreParameter().renderWidth, PSP_CoreParameter().renderHeight);
+						}
+						if (g_Config.bDumpAudio) {
+							WAVDump::Reset();
+						}
+					}
+#endif
 				} else if (result == CChunkFileReader::ERROR_BROKEN_STATE) {
 					HandleFailure();
-					osm.Show(i18nSaveFailure, 2.0);
-					ERROR_LOG(COMMON, "Save state failure: %s", reason.c_str());
+					callbackMessage = i18nSaveFailure;
+					ERROR_LOG(SAVESTATE, "Save state failure: %s", reason.c_str());
 					callbackResult = false;
 				} else {
-					osm.Show(i18nSaveFailure, 2.0);
+					callbackMessage = i18nSaveFailure;
 					callbackResult = false;
 				}
 				break;
 
 			case SAVESTATE_VERIFY:
-				INFO_LOG(COMMON, "Verifying save state system");
 				callbackResult = CChunkFileReader::Verify(state) == CChunkFileReader::ERROR_NONE;
+				if (callbackResult) {
+					INFO_LOG(SAVESTATE, "Verified save state system");
+				} else {
+					ERROR_LOG(SAVESTATE, "Save state system verification failed");
+				}
 				break;
 
 			case SAVESTATE_REWIND:
-				INFO_LOG(COMMON, "Rewinding to recent savestate snapshot");
+				INFO_LOG(SAVESTATE, "Rewinding to recent savestate snapshot");
 				result = rewindStates.Restore();
 				if (result == CChunkFileReader::ERROR_NONE) {
-					osm.Show(s->T("Loaded State"), 2.0);
+					callbackMessage = sc->T("Loaded State");
 					callbackResult = true;
 					hasLoadedState = true;
 				} else if (result == CChunkFileReader::ERROR_BROKEN_STATE) {
 					// Cripes.  Good news is, we might have more.  Let's try those too, better than a reset.
 					if (HandleFailure()) {
 						// Well, we did rewind, even if too much...
-						osm.Show(s->T("Loaded State"), 2.0);
+						callbackMessage = sc->T("Loaded State");
 						callbackResult = true;
 						hasLoadedState = true;
 					} else {
-						osm.Show(i18nLoadFailure, 2.0);
+						callbackMessage = i18nLoadFailure;
 						callbackResult = false;
 					}
 				} else {
-					osm.Show(i18nLoadFailure, 2.0);
+					callbackMessage = i18nLoadFailure;
 					callbackResult = false;
 				}
 				break;
 
+			case SAVESTATE_SAVE_SCREENSHOT:
+				callbackResult = TakeGameScreenshot(op.filename.c_str(), ScreenshotFormat::JPG, SCREENSHOT_DISPLAY);
+				if (!callbackResult) {
+					ERROR_LOG(SAVESTATE, "Failed to take a screenshot for the savestate! %s", op.filename.c_str());
+				}
+				break;
+
 			default:
-				ERROR_LOG(COMMON, "Savestate failure: unknown operation type %d", op.type);
+				ERROR_LOG(SAVESTATE, "Savestate failure: unknown operation type %d", op.type);
 				callbackResult = false;
 				break;
 			}
 
 			if (op.callback)
-				op.callback(callbackResult, op.cbUserData);
+				op.callback(callbackResult, callbackMessage, op.cbUserData);
 		}
 		if (operations.size()) {
 			// Avoid triggering frame skipping due to slowdown
@@ -562,9 +715,15 @@ namespace SaveState
 		// Make sure there's a directory for save slots
 		pspFileSystem.MkDir("ms0:/PSP/PPSSPP_STATE");
 
-		std::lock_guard<std::recursive_mutex> guard(mutex);
+		std::lock_guard<std::mutex> guard(mutex);
 		rewindStates.Clear();
 
 		hasLoadedState = false;
+	}
+
+	void Shutdown()
+	{
+		std::lock_guard<std::mutex> guard(mutex);
+		rewindStates.Clear();
 	}
 }

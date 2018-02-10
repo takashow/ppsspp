@@ -15,38 +15,64 @@
 // Official SVN repository and contact information can be found at
 // http://code.google.com/p/dolphin-emu/
 
+#include "ppsspp_config.h"
+#if PPSSPP_ARCH(ARM) || PPSSPP_ARCH(ARM64)
+
+#include <ctype.h>
 #include "Common.h"
 #include "CPUDetect.h"
 #include "StringUtils.h"
 #include "FileUtil.h"
-#ifdef BLACKBERRY
-#include <bps/deviceinfo.h>
-#endif
 
 // Only Linux platforms have /proc/cpuinfo
-#if defined(__linux__)
+#if PPSSPP_PLATFORM(LINUX)
 const char procfile[] = "/proc/cpuinfo";
 // https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-devices-system-cpu
 const char syscpupresentfile[] = "/sys/devices/system/cpu/present";
 
-std::string GetCPUString()
-{
-	std::string line, marker = "Hardware\t: ";
-	std::string cpu_string = "Unknown";
+std::string GetCPUString() {
+	std::string cpu_string;
 	std::fstream file;
-	if (!File::OpenCPPFile(file, procfile, std::ios::in))
-		return cpu_string;
-	
-	while (std::getline(file, line))
-	{
-		if (line.find(marker) != std::string::npos)
-		{
-			cpu_string = line.substr(marker.length());
-			cpu_string.pop_back(); // Drop the new-line character
+
+	if (File::OpenCPPFile(file, procfile, std::ios::in)) {
+		std::string line, marker = "Hardware\t: ";
+		while (std::getline(file, line)) {
+			if (line.find(marker) != std::string::npos) {
+				cpu_string = line.substr(marker.length());
+			}
 		}
 	}
 
+	if (cpu_string.empty())
+		cpu_string = "Unknown";
+	else if (cpu_string.back() == '\n')
+		cpu_string.pop_back(); // Drop the new-line character
+
 	return cpu_string;
+}
+
+std::string GetCPUBrandString() {
+	std::string brand_string;
+	std::fstream file;
+
+	if (File::OpenCPPFile(file, procfile, std::ios::in)) {
+		std::string line, marker = "Processor\t: ";
+		while (std::getline(file, line)) {
+			if (line.find(marker) != std::string::npos) {
+				brand_string = line.substr(marker.length());
+				if (brand_string.length() != 0 && !isdigit(brand_string[0])) {
+					break;
+				}
+			}
+		}
+	}
+
+	if (brand_string.empty())
+		brand_string = "Unknown";
+	else if (brand_string.back() == '\n')
+		brand_string.pop_back(); // Drop the new-line character
+
+	return brand_string;
 }
 
 unsigned char GetCPUImplementer()
@@ -100,7 +126,7 @@ bool CheckCPUFeature(const std::string& feature)
 
 	if (!File::OpenCPPFile(file, procfile, std::ios::in))
 		return 0;
-	
+
 	while (std::getline(file, line))
 	{
 		if (line.find(marker) != std::string::npos)
@@ -114,7 +140,7 @@ bool CheckCPUFeature(const std::string& feature)
 			}
 		}
 	}
-	
+
 	return false;
 }
 
@@ -159,7 +185,7 @@ void CPUInfo::Detect()
 {
 	// Set some defaults here
 	HTT = false;
-#ifdef _M_ARM_64
+#if PPSSPP_ARCH(ARM64)
 	OS64bit = true;
 	CPU64bit = true;
 	Mode64bit = true;
@@ -169,12 +195,12 @@ void CPUInfo::Detect()
 	Mode64bit = false;
 #endif
 	vendor = VENDOR_ARM;
-	
+
 	// Get the information about the CPU 
-#if !defined(__linux__)
+#if !PPSSPP_PLATFORM(LINUX)
 	bool isVFP3 = false;
 	bool isVFP4 = false;
-#ifdef IOS
+#if PPSSPP_PLATFORM(IOS)
 	isVFP3 = true;
 	// Check for swift arch (VFP4)
 #ifdef __ARM_ARCH_7S__
@@ -182,23 +208,18 @@ void CPUInfo::Detect()
 #endif
 	strcpy(brand_string, "Apple A");
 	num_cores = 2;
-#elif defined(BLACKBERRY)
+#elif PPSSPP_PLATFORM(UWP)
+	strcpy(brand_string, "Unknown");
 	isVFP3 = true;
-	deviceinfo_details_t* details;
-	deviceinfo_get_details(&details);
-	num_cores = deviceinfo_details_get_processor_core_count(details);
-	strcpy(brand_string, deviceinfo_details_get_processor_name(details));
-	if (!strncmp(brand_string, "MSM", 3))
-		isVFP4 = true;
-	deviceinfo_free_details(&details);
-#elif defined(__SYMBIAN32__)
-	strcpy(brand_string, "Samsung ARMv6");
-	num_cores = 1;
-#else
+	isVFP4 = false;
+	SYSTEM_INFO sysInfo;
+	GetSystemInfo(&sysInfo);
+	num_cores = sysInfo.dwNumberOfProcessors;
+#else // !PPSSPP_PLATFORM(IOS)
 	strcpy(brand_string, "Unknown");
 	num_cores = 1;
 #endif
-	strncpy(cpu_string, brand_string, sizeof(cpu_string));
+	truncate_cpy(cpu_string, brand_string);
 	// Hardcode this for now
 	bSwp = true;
 	bHalf = true;
@@ -215,8 +236,10 @@ void CPUInfo::Detect()
 	bIDIVt = isVFP4;
 	bFP = false;
 	bASIMD = false;
-#else // __linux__
-	strncpy(cpu_string, GetCPUString().c_str(), sizeof(cpu_string));
+#else // PPSSPP_PLATFORM(LINUX)
+	truncate_cpy(cpu_string, GetCPUString().c_str());
+	truncate_cpy(brand_string, GetCPUBrandString().c_str());
+
 	bSwp = CheckCPUFeature("swp");
 	bHalf = CheckCPUFeature("half");
 	bThumb = CheckCPUFeature("thumb");
@@ -239,6 +262,11 @@ void CPUInfo::Detect()
 	bASIMD = CheckCPUFeature("asimd");
 	num_cores = GetCoreCount();
 #endif
+#if PPSSPP_ARCH(ARM64)
+	// Whether the above detection failed or not, on ARM64 we do have ASIMD/NEON.
+	bNEON = true;
+	bASIMD = true;
+#endif
 }
 
 // Turn the cpu info into a string we can show
@@ -246,9 +274,9 @@ std::string CPUInfo::Summarize()
 {
 	std::string sum;
 	if (num_cores == 1)
-		sum = StringFromFormat("%s, %i core", cpu_string, num_cores);
+		sum = StringFromFormat("%s, %d core", cpu_string, num_cores);
 	else
-		sum = StringFromFormat("%s, %i cores", cpu_string, num_cores);
+		sum = StringFromFormat("%s, %d cores", cpu_string, num_cores);
 	if (bSwp) sum += ", SWP";
 	if (bHalf) sum += ", Half";
 	if (bThumb) sum += ", Thumb";
@@ -266,3 +294,5 @@ std::string CPUInfo::Summarize()
 
 	return sum;
 }
+
+#endif // PPSSPP_ARCH(ARM) || PPSSPP_ARCH(ARM64)

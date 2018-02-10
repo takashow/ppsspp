@@ -15,6 +15,7 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include <algorithm>
 #include <vector>
 
 #include "base/colorutil.h"
@@ -47,7 +48,7 @@ public:
 		scale_ = theScale_;
 	}
 
-	virtual bool IsDown() {
+	bool IsDown() override {
 		// Don't want the button to enlarge and throw the user's perspective
 		// of button size off whack.
 		return false;
@@ -64,6 +65,12 @@ public:
 
 	virtual float GetSpacing() const { return 1.0f; }
 	virtual void SetSpacing(float s) { }
+
+protected:
+	float GetButtonOpacity() override {
+		float opacity = g_Config.iTouchButtonOpacity / 100.0f;
+		return std::max(0.5f, opacity);
+	}
 
 private:
 	// convert from screen coordinates (leftColumnWidth to dp_xres) to actual fullscreen coordinates (0 to 1.0)
@@ -111,7 +118,7 @@ public:
 		squareVisible_ = visible;
 	}
 
-	void Draw(UIContext &dc) {
+	void Draw(UIContext &dc) override {
 		float opacity = g_Config.iTouchButtonOpacity / 100.0f;
 
 		uint32_t colorBg = colorAlpha(GetButtonColor(), opacity);
@@ -144,19 +151,15 @@ public:
 		}
 	};
 
-	void GetContentDimensions(const UIContext &dc, float &w, float &h) const{
+	void GetContentDimensions(const UIContext &dc, float &w, float &h) const override {
 		const AtlasImage &image = dc.Draw()->GetAtlas()->images[roundId_];
 
 		w = (2 * baseActionButtonSpacing * spacing_) + image.w * scale_;
 		h = (2 * baseActionButtonSpacing * spacing_) + image.h * scale_;
 	}
 
-	virtual float GetSpacing() const { return spacing_; }
-	virtual void SetSpacing(float s) { spacing_ = s; }
-	
-	virtual void SavePosition() {
-		DragDropButton::SavePosition();
-	}
+	float GetSpacing() const override { return spacing_; }
+	void SetSpacing(float s) override { spacing_ = s; }
 
 private:
 	bool circleVisible_, crossVisible_, triangleVisible_, squareVisible_;
@@ -173,7 +176,7 @@ public:
 		: DragDropButton(x, y, -1, -1, scale), spacing_(spacing) {
 	}
 
-	void Draw(UIContext &dc) {
+	void Draw(UIContext &dc) override {
 		float opacity = g_Config.iTouchButtonOpacity / 100.0f;
 
 		uint32_t colorBg = colorAlpha(GetButtonColor(), opacity);
@@ -197,14 +200,14 @@ public:
 		}
 	}
 
-	void GetContentDimensions(const UIContext &dc, float &w, float &h) const{
+	void GetContentDimensions(const UIContext &dc, float &w, float &h) const override {
 		const AtlasImage &image = dc.Draw()->GetAtlas()->images[I_DIR];
 		w = 2 * D_pad_Radius * spacing_ + image.w * scale_;
 		h = 2 * D_pad_Radius * spacing_ + image.h * scale_;
 	};
 
-	float GetSpacing() const { return spacing_; }
-	virtual void SetSpacing(float s) { spacing_ = s; }
+	float GetSpacing() const override { return spacing_; }
+	void SetSpacing(float s) override { spacing_ = s; }
 
 private:
 	float &spacing_;
@@ -276,7 +279,11 @@ bool TouchControlLayoutScreen::touch(const TouchInput &touch) {
 		pickedControl_ = 0;
 	}
 	return true;
-};
+}
+
+void TouchControlLayoutScreen::resized() {
+	RecreateViews();
+}
 
 void TouchControlLayoutScreen::onFinish(DialogResult reason) {
 	g_Config.Save();
@@ -310,20 +317,20 @@ void TouchControlLayoutScreen::CreateViews() {
 
 	using namespace UI;
 
-	I18NCategory *c = GetI18NCategory("Controls");
-	I18NCategory *d = GetI18NCategory("Dialog");
+	I18NCategory *co = GetI18NCategory("Controls");
+	I18NCategory *di = GetI18NCategory("Dialog");
 
 	root_ = new AnchorLayout(new LayoutParams(FILL_PARENT, FILL_PARENT));
 
-	Choice *reset = new Choice(d->T("Reset"), "", false, new AnchorLayoutParams(leftColumnWidth, WRAP_CONTENT, 10, NONE, NONE, 84));
-	Choice *back = new Choice(d->T("Back"), "", false, new AnchorLayoutParams(leftColumnWidth, WRAP_CONTENT, 10, NONE, NONE, 10));
-	Choice *visibility = new Choice(c->T("Visibility"), "", false, new AnchorLayoutParams(leftColumnWidth, WRAP_CONTENT, 10, NONE, NONE, 158));
-	// controlsSettings->Add(new PopupSliderChoiceFloat(&g_Config.fButtonScale, 0.80, 2.0, c->T("Button Scaling"), screenManager()))
+	Choice *reset = new Choice(di->T("Reset"), "", false, new AnchorLayoutParams(leftColumnWidth, WRAP_CONTENT, 10, NONE, NONE, 84));
+	Choice *back = new Choice(di->T("Back"), "", false, new AnchorLayoutParams(leftColumnWidth, WRAP_CONTENT, 10, NONE, NONE, 10));
+	Choice *visibility = new Choice(co->T("Visibility"), "", false, new AnchorLayoutParams(leftColumnWidth, WRAP_CONTENT, 10, NONE, NONE, 158));
+	// controlsSettings->Add(new PopupSliderChoiceFloat(&g_Config.fButtonScale, 0.80, 2.0, co->T("Button Scaling"), screenManager()))
 	// 	->OnChange.Handle(this, &GameSettingsScreen::OnChangeControlScaling);
 
 	mode_ = new ChoiceStrip(ORIENT_VERTICAL, new AnchorLayoutParams(leftColumnWidth, WRAP_CONTENT, 10, NONE, NONE, 158 + 64 + 10));
-	mode_->AddChoice(d->T("Move"));
-	mode_->AddChoice(d->T("Resize"));
+	mode_->AddChoice(di->T("Move"));
+	mode_->AddChoice(di->T("Resize"));
 	mode_->SetSelection(0);
 
 	reset->OnClick.Handle(this, &TouchControlLayoutScreen::OnReset);
@@ -335,6 +342,7 @@ void TouchControlLayoutScreen::CreateViews() {
 	root_->Add(back);
 
 	TabHolder *tabHolder = new TabHolder(ORIENT_VERTICAL, leftColumnWidth, new AnchorLayoutParams(10, 0, 10, 0, false));
+	tabHolder->SetTag("TouchControlLayout");
 	root_->Add(tabHolder);
 
 	// this is more for show than anything else. It's used to provide a boundary
@@ -366,6 +374,9 @@ void TouchControlLayoutScreen::CreateViews() {
 	int dirImage = g_Config.iTouchButtonStyle ? I_DIR_LINE : I_DIR;
 	int stickImage = g_Config.iTouchButtonStyle ? I_STICK_LINE : I_STICK;
 	int stickBg = g_Config.iTouchButtonStyle ? I_STICK_BG_LINE : I_STICK_BG;
+	int roundImage = g_Config.iTouchButtonStyle ? I_ROUND_LINE : I_ROUND;
+
+	const int comboKeyImages[5] = { I_1, I_2, I_3, I_4, I_5 };
 
 	if (g_Config.bShowTouchDpad) {
 		controls_.push_back(new PSPDPadButtons(g_Config.fDpadX, g_Config.fDpadY, g_Config.fDpadScale, g_Config.fDpadSpacing));
@@ -397,6 +408,21 @@ void TouchControlLayoutScreen::CreateViews() {
 
 	if (g_Config.bShowTouchAnalogStick) {
 		controls_.push_back(new DragDropButton(g_Config.fAnalogStickX, g_Config.fAnalogStickY, stickBg, stickImage, g_Config.fAnalogStickScale));
+	}
+	if (g_Config.bShowComboKey0) {
+		controls_.push_back(new DragDropButton(g_Config.fcombo0X, g_Config.fcombo0Y, roundImage, comboKeyImages[0], g_Config.fcomboScale0));
+	}
+	if (g_Config.bShowComboKey1) {
+		controls_.push_back(new DragDropButton(g_Config.fcombo1X, g_Config.fcombo1Y, roundImage, comboKeyImages[1], g_Config.fcomboScale1));
+	}
+	if (g_Config.bShowComboKey2) {
+		controls_.push_back(new DragDropButton(g_Config.fcombo2X, g_Config.fcombo2Y, roundImage, comboKeyImages[2], g_Config.fcomboScale2));
+	}
+	if (g_Config.bShowComboKey3) {
+		controls_.push_back(new DragDropButton(g_Config.fcombo3X, g_Config.fcombo3Y, roundImage, comboKeyImages[3], g_Config.fcomboScale3));
+	}
+	if (g_Config.bShowComboKey4) {
+		controls_.push_back(new DragDropButton(g_Config.fcombo4X, g_Config.fcombo4Y, roundImage, comboKeyImages[4], g_Config.fcomboScale4));
 	};
 
 	for (size_t i = 0; i < controls_.size(); i++) {

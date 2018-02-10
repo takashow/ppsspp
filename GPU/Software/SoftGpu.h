@@ -19,8 +19,10 @@
 
 #include "GPU/GPUCommon.h"
 #include "GPU/Common/GPUDebugInterface.h"
+#include "thin3d/thin3d.h"
 
-typedef struct {
+struct FormatBuffer {
+	FormatBuffer() { data = nullptr; }
 	union {
 		u8 *data;
 		u16 *as16;
@@ -42,61 +44,77 @@ typedef struct {
 	inline u32 Get32(int x, int y, int stride) {
 		return as32[x + y * stride];
 	}
-} FormatBuffer;
+};
 
-class ShaderManager;
+class SoftwareDrawEngine;
 
-class SoftGPU : public GPUCommon
-{
+class SoftGPU : public GPUCommon {
 public:
-	SoftGPU();
+	SoftGPU(GraphicsContext *gfxCtx, Draw::DrawContext *_thin3D);
 	~SoftGPU();
-	virtual void InitClear() {}
-	virtual void ExecuteOp(u32 op, u32 diff);
+	void InitClear() override {}
+	void ExecuteOp(u32 op, u32 diff) override;
 
-	virtual void BeginFrame() {}
-	virtual void SetDisplayFramebuffer(u32 framebuf, u32 stride, GEBufferFormat format);
-	virtual void CopyDisplayToOutput();
-	virtual void UpdateStats();
-	virtual void InvalidateCache(u32 addr, int size, GPUInvalidationType type);
-	virtual bool PerformMemoryCopy(u32 dest, u32 src, int size);
-	virtual bool PerformMemorySet(u32 dest, u8 v, int size);
-	virtual bool PerformMemoryDownload(u32 dest, int size);
-	virtual bool PerformMemoryUpload(u32 dest, int size);
-	virtual bool PerformStencilUpload(u32 dest, int size);
-	virtual void ClearCacheNextFrame() {};
+	void SetDisplayFramebuffer(u32 framebuf, u32 stride, GEBufferFormat format) override;
+	void CopyDisplayToOutput() override;
+	void GetStats(char *buffer, size_t bufsize) override;
+	void InvalidateCache(u32 addr, int size, GPUInvalidationType type) override;
+	void NotifyVideoUpload(u32 addr, int size, int width, int format) override;
+	bool PerformMemoryCopy(u32 dest, u32 src, int size) override;
+	bool PerformMemorySet(u32 dest, u8 v, int size) override;
+	bool PerformMemoryDownload(u32 dest, int size) override;
+	bool PerformMemoryUpload(u32 dest, int size) override;
+	bool PerformStencilUpload(u32 dest, int size) override;
+	void ClearCacheNextFrame() override {}
 
-	virtual void DeviceLost() {}
-	virtual void DumpNextFrame() {}
+	void DeviceLost() override;
+	void DeviceRestore() override;
 
-	virtual void Resized() {}
-	virtual void GetReportingInfo(std::string &primaryInfo, std::string &fullInfo) {
+	void Resized() override {}
+	void GetReportingInfo(std::string &primaryInfo, std::string &fullInfo) override {
 		primaryInfo = "Software";
 		fullInfo = "Software";
 	}
 
-	virtual bool FramebufferDirty();
+	bool FramebufferDirty() override;
 
-	virtual bool FramebufferReallyDirty() {
+	bool FramebufferReallyDirty() override {
 		return !(gstate_c.skipDrawReason & SKIPDRAW_SKIPFRAME);
 	}
 
-	virtual bool GetCurrentFramebuffer(GPUDebugBuffer &buffer);
-	virtual bool GetCurrentDepthbuffer(GPUDebugBuffer &buffer);
-	virtual bool GetCurrentStencilbuffer(GPUDebugBuffer &buffer);
-	virtual bool GetCurrentTexture(GPUDebugBuffer &buffer, int level);
-	bool GetCurrentSimpleVertices(int count, std::vector<GPUDebugVertex> &vertices, std::vector<u16> &indices);
+	bool GetCurrentFramebuffer(GPUDebugBuffer &buffer, GPUDebugFramebufferType type, int maxRes = -1) override;
+	bool GetOutputFramebuffer(GPUDebugBuffer &buffer) override;
+	bool GetCurrentDepthbuffer(GPUDebugBuffer &buffer) override;
+	bool GetCurrentStencilbuffer(GPUDebugBuffer &buffer) override;
+	bool GetCurrentTexture(GPUDebugBuffer &buffer, int level) override;
+	bool GetCurrentClut(GPUDebugBuffer &buffer) override;
+	bool GetCurrentSimpleVertices(int count, std::vector<GPUDebugVertex> &vertices, std::vector<u16> &indices) override;
+
+	bool DescribeCodePtr(const u8 *ptr, std::string &name) override;
 
 protected:
-	virtual void FastRunLoop(DisplayList &list);
-	virtual void ProcessEvent(GPUEvent ev);
+	void FastRunLoop(DisplayList &list) override;
 	void CopyToCurrentFboFromDisplayRam(int srcwidth, int srcheight);
 
 private:
-	void CopyDisplayToOutputInternal();
-
 	bool framebufferDirty_;
 	u32 displayFramebuf_;
 	u32 displayStride_;
 	GEBufferFormat displayFormat_;
+
+	SoftwareDrawEngine *drawEngine_ = nullptr;
+
+	Draw::Texture *fbTex;
+	Draw::Pipeline *texColor;
+	std::vector<u32> fbTexBuffer;
+
+	Draw::SamplerState *samplerNearest = nullptr;
+	Draw::SamplerState *samplerLinear = nullptr;
+	Draw::Buffer *vdata = nullptr;
+	Draw::Buffer *idata = nullptr;
 };
+
+// TODO: These shouldn't be global.
+extern u32 clut[4096];
+extern FormatBuffer fb;
+extern FormatBuffer depthbuf;

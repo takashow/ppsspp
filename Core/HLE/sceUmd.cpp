@@ -20,8 +20,10 @@
 #include "file/file_util.h"
 
 #include "Common/ChunkFile.h"
+#include "Core/Loaders.h"
 #include "Core/MemMap.h"
 #include "Core/System.h"
+#include "Core/Host.h"
 #include "Core/CoreTiming.h"
 #include "Core/Reporting.h"
 #include "Core/MIPS/MIPS.h"
@@ -46,10 +48,12 @@ static u32 umdErrorStat = 0;
 static int driveCBId = 0;
 static int umdStatTimeoutEvent = -1;
 static int umdStatChangeEvent = -1;
+static int umdInsertChangeEvent = -1;
 static std::vector<SceUID> umdWaitingThreads;
 static std::map<SceUID, u64> umdPausedWaits;
 
 bool UMDReplacePermit = false;
+bool UMDInserted = true;
 
 struct PspUmdInfo {
 	u32_le size;
@@ -58,6 +62,7 @@ struct PspUmdInfo {
 
 void __UmdStatTimeout(u64 userdata, int cyclesLate);
 void __UmdStatChange(u64 userdata, int cyclesLate);
+void __UmdInsertChange(u64 userdata, int cyclesLate);
 void __UmdBeginCallback(SceUID threadID, SceUID prevCallbackId);
 void __UmdEndCallback(SceUID threadID, SceUID prevCallbackId);
 
@@ -65,6 +70,7 @@ void __UmdInit()
 {
 	umdStatTimeoutEvent = CoreTiming::RegisterEvent("UmdTimeout", __UmdStatTimeout);
 	umdStatChangeEvent = CoreTiming::RegisterEvent("UmdChange", __UmdStatChange);
+	umdInsertChangeEvent = CoreTiming::RegisterEvent("UmdInsertChange", __UmdInsertChange);
 	umdActivated = 1;
 	umdStatus = 0;
 	umdErrorStat = 0;
@@ -77,7 +83,7 @@ void __UmdInit()
 
 void __UmdDoState(PointerWrap &p)
 {
-	auto s = p.Section("sceUmd", 1, 2);
+	auto s = p.Section("sceUmd", 1, 3);
 	if (!s)
 		return;
 
@@ -92,11 +98,21 @@ void __UmdDoState(PointerWrap &p)
 	p.Do(umdWaitingThreads);
 	p.Do(umdPausedWaits);
 
-	if (s > 1)
+	if (s > 1) {
 		p.Do(UMDReplacePermit);
+		if (UMDReplacePermit)
+			host->UpdateUI();
+	}
+	if (s > 2) {
+		p.Do(umdInsertChangeEvent);
+		CoreTiming::RestoreRegisterEvent(umdInsertChangeEvent, "UmdInsertChange", __UmdInsertChange);
+		p.Do(UMDInserted);
+	}
+	else
+		UMDInserted = true;
 }
 
-u8 __KernelUmdGetState()
+static u8 __KernelUmdGetState()
 {
 	// Most games seem to expect the disc to be ready early on, active or not.
 	// It seems like the PSP sets this state when the disc is "ready".
@@ -105,6 +121,11 @@ u8 __KernelUmdGetState()
 		state |= PSP_UMD_READABLE;
 	}
 	return state;
+}
+
+void __UmdInsertChange(u64 userdata, int cyclesLate)
+{
+	UMDInserted = true;
 }
 
 void __UmdStatChange(u64 userdata, int cyclesLate)
@@ -132,7 +153,7 @@ void __UmdStatChange(u64 userdata, int cyclesLate)
 	}
 }
 
-void __KernelUmdActivate()
+static void __KernelUmdActivate()
 {
 	u32 notifyArg = PSP_UMD_PRESENT | PSP_UMD_READABLE;
 	// PSP_UMD_READY will be returned when sceKernelGetCompiledSdkVersion() != 0
@@ -147,7 +168,7 @@ void __KernelUmdActivate()
 	CoreTiming::ScheduleEvent(usToCycles(MICRO_DELAY_ACTIVATE), umdStatChangeEvent, 1);
 }
 
-void __KernelUmdDeactivate()
+static void __KernelUmdDeactivate()
 {
 	u32 notifyArg = PSP_UMD_PRESENT | PSP_UMD_READY;
 	if (driveCBId != 0)
@@ -222,13 +243,17 @@ void __UmdEndCallback(SceUID threadID, SceUID prevCallbackId)
 	}
 }
 
-int sceUmdCheckMedium()
+static int sceUmdCheckMedium()
 {
-	DEBUG_LOG(SCEIO, "1=sceUmdCheckMedium()");
-	return 1; //non-zero: disc in drive
+	if (UMDInserted) {
+		DEBUG_LOG(SCEIO, "1=sceUmdCheckMedium()");
+		return 1; //non-zero: disc in drive
+	}
+	DEBUG_LOG(SCEIO, "0=sceUmdCheckMedium()");
+	return 0;
 }
 	
-u32 sceUmdGetDiscInfo(u32 infoAddr)
+static u32 sceUmdGetDiscInfo(u32 infoAddr)
 {
 	DEBUG_LOG(SCEIO, "sceUmdGetDiscInfo(%08x)", infoAddr);
 
@@ -243,7 +268,7 @@ u32 sceUmdGetDiscInfo(u32 infoAddr)
 		return PSP_ERROR_UMD_INVALID_PARAM;
 }
 
-int sceUmdActivate(u32 mode, const char *name)
+static int sceUmdActivate(u32 mode, const char *name)
 {
 	if (mode < 1 || mode > 2)
 		return PSP_ERROR_UMD_INVALID_PARAM;
@@ -259,7 +284,7 @@ int sceUmdActivate(u32 mode, const char *name)
 	return 0;
 }
 
-int sceUmdDeactivate(u32 mode, const char *name)
+static int sceUmdDeactivate(u32 mode, const char *name)
 {
 	// Why 18?  No idea.
 	if (mode > 18)
@@ -276,7 +301,7 @@ int sceUmdDeactivate(u32 mode, const char *name)
 	return 0;
 }
 
-u32 sceUmdRegisterUMDCallBack(u32 cbId)
+static u32 sceUmdRegisterUMDCallBack(u32 cbId)
 {
 	int retVal = 0;
 
@@ -291,7 +316,7 @@ u32 sceUmdRegisterUMDCallBack(u32 cbId)
 	return retVal;
 }
 
-int sceUmdUnRegisterUMDCallBack(int cbId)
+static int sceUmdUnRegisterUMDCallBack(int cbId)
 {
 	int retVal;
 
@@ -309,8 +334,12 @@ int sceUmdUnRegisterUMDCallBack(int cbId)
 	return retVal;
 }
 
-u32 sceUmdGetDriveStat()
+static u32 sceUmdGetDriveStat()
 {
+	if (!UMDInserted) {
+		WARN_LOG(SCEIO, "sceUmdGetDriveStat: UMD is taking out for switch UMD");
+		return PSP_UMD_NOT_PRESENT;
+	}
 	//u32 retVal = PSP_UMD_INITED | PSP_UMD_READY | PSP_UMD_PRESENT;
 	u32 retVal = __KernelUmdGetState();
 	DEBUG_LOG(SCEIO,"0x%02x=sceUmdGetDriveStat()", retVal);
@@ -330,7 +359,7 @@ void __UmdStatTimeout(u64 userdata, int cyclesLate)
 	HLEKernel::RemoveWaitingThread(umdWaitingThreads, threadID);
 }
 
-void __UmdWaitStat(u32 timeout)
+static void __UmdWaitStat(u32 timeout)
 {
 	// This happens to be how the hardware seems to time things.
 	if (timeout <= 4)
@@ -348,7 +377,7 @@ void __UmdWaitStat(u32 timeout)
 * @return < 0 on error
 *
 */
-int sceUmdWaitDriveStat(u32 stat)
+static int sceUmdWaitDriveStat(u32 stat)
 {
 	if (stat == 0) {
 		DEBUG_LOG(SCEIO, "sceUmdWaitDriveStat(stat = %08x): bad status", stat);
@@ -375,7 +404,7 @@ int sceUmdWaitDriveStat(u32 stat)
 	return 0;
 }
 
-int sceUmdWaitDriveStatWithTimer(u32 stat, u32 timeout)
+static int sceUmdWaitDriveStatWithTimer(u32 stat, u32 timeout)
 {
 	if (stat == 0) {
 		DEBUG_LOG(SCEIO, "sceUmdWaitDriveStatWithTimer(stat = %08x, timeout = %d): bad status", stat, timeout);
@@ -405,8 +434,13 @@ int sceUmdWaitDriveStatWithTimer(u32 stat, u32 timeout)
 	return 0;
 }
 
-int sceUmdWaitDriveStatCB(u32 stat, u32 timeout)
+static int sceUmdWaitDriveStatCB(u32 stat, u32 timeout)
 {
+	if (!UMDInserted) {
+		WARN_LOG(SCEIO, "sceUmdWaitDriveStatCB(stat = %08x, timeout = %d): UMD is taking out for switch UMD", stat, timeout);
+		return PSP_UMD_NOT_PRESENT;
+	}
+
 	if (stat == 0) {
 		DEBUG_LOG(SCEIO, "sceUmdWaitDriveStatCB(stat = %08x, timeout = %d): bad status", stat, timeout);
 		return SCE_KERNEL_ERROR_ERRNO_INVALID_ARGUMENT;
@@ -439,7 +473,7 @@ int sceUmdWaitDriveStatCB(u32 stat, u32 timeout)
 	return 0;
 }
 
-u32 sceUmdCancelWaitDriveStat()
+static u32 sceUmdCancelWaitDriveStat()
 {
 	DEBUG_LOG(SCEIO, "0=sceUmdCancelWaitDriveStat()");
 
@@ -453,27 +487,34 @@ u32 sceUmdCancelWaitDriveStat()
 	return 0;
 }
 
-u32 sceUmdGetErrorStat()
+static u32 sceUmdGetErrorStat()
 {
 	DEBUG_LOG(SCEIO,"%i=sceUmdGetErrorStat()", umdErrorStat);
 	return umdErrorStat;
 }
 
 void __UmdReplace(std::string filepath) {
+	// TODO: This should really go through Loaders, no?  What if it's an invalid file?
+
 	// Only get system from disc0 seems have been enough.
 	IFileSystem* currentUMD = pspFileSystem.GetSystem("disc0:");
 	IFileSystem* currentISOBlock = pspFileSystem.GetSystem("umd0:");
 	if (!currentUMD)
 		return;
 
+	FileLoader *loadedFile = ConstructFileLoader(filepath);
+
 	IFileSystem* umd2;
-	FileInfo info;
-	if (!getFileInfo(filepath.c_str(), &info))    // This shouldn't happen, but for safety.
+	if (!loadedFile->Exists()) {
+		delete loadedFile;
 		return;
-	if (info.isDirectory) {
+	}
+	UpdateLoadedFile(loadedFile);
+
+	if (loadedFile->IsDirectory()) {
 		umd2 = new VirtualDiscFileSystem(&pspFileSystem, filepath);
 	} else {
-		auto bd = constructBlockDevice(filepath.c_str());
+		auto bd = constructBlockDevice(loadedFile);
 		if (!bd)
 			return;
 		umd2 = new ISOFileSystem(&pspFileSystem, bd);
@@ -487,7 +528,8 @@ void __UmdReplace(std::string filepath) {
 		}
 	}
 	delete currentUMD;
-
+	UMDInserted = false;
+	CoreTiming::ScheduleEvent(usToCycles(200*1000), umdInsertChangeEvent, 0); // Wait sceUmdCheckMedium call
 	// TODO Is this always correct if UMD was not activated?
 	u32 notifyArg = PSP_UMD_PRESENT | PSP_UMD_READABLE | PSP_UMD_CHANGED;
 	if (driveCBId != -1)
@@ -498,38 +540,40 @@ bool getUMDReplacePermit() {
 	return UMDReplacePermit;
 }
 
-u32 sceUmdReplaceProhibit()
+static u32 sceUmdReplaceProhibit()
 {
 	UMDReplacePermit = false;
 	DEBUG_LOG(SCEIO,"sceUmdReplaceProhibit()");
+	host->UpdateUI();
 	return 0;
 }
 
-u32 sceUmdReplacePermit()
+static u32 sceUmdReplacePermit()
 {
 	UMDReplacePermit = true;
 	DEBUG_LOG(SCEIO,"sceUmdReplacePermit()");
+	host->UpdateUI();
 	return 0;
 }
 
 const HLEFunction sceUmdUser[] = 
 {
-	{0xC6183D47,WrapI_UC<sceUmdActivate>,"sceUmdActivate"},
-	{0x6B4A146C,&WrapU_V<sceUmdGetDriveStat>,"sceUmdGetDriveStat"},
-	{0x46EBB729,WrapI_V<sceUmdCheckMedium>,"sceUmdCheckMedium"},
-	{0xE83742BA,WrapI_UC<sceUmdDeactivate>,"sceUmdDeactivate"},
-	{0x8EF08FCE,WrapI_U<sceUmdWaitDriveStat>,"sceUmdWaitDriveStat"},
-	{0x56202973,WrapI_UU<sceUmdWaitDriveStatWithTimer>,"sceUmdWaitDriveStatWithTimer"},
-	{0x4A9E5E29,WrapI_UU<sceUmdWaitDriveStatCB>,"sceUmdWaitDriveStatCB"},
-	{0x6af9b50a,WrapU_V<sceUmdCancelWaitDriveStat>,"sceUmdCancelWaitDriveStat"},
-	{0x20628E6F,&WrapU_V<sceUmdGetErrorStat>,"sceUmdGetErrorStat"},
-	{0x340B7686,WrapU_U<sceUmdGetDiscInfo>,"sceUmdGetDiscInfo"},
-	{0xAEE7404D,&WrapU_U<sceUmdRegisterUMDCallBack>,"sceUmdRegisterUMDCallBack"},
-	{0xBD2BDE07,&WrapI_I<sceUmdUnRegisterUMDCallBack>,"sceUmdUnRegisterUMDCallBack"},
-	{0x87533940,WrapU_V<sceUmdReplaceProhibit>,"sceUmdReplaceProhibit"},
-	{0xCBE9F02A,WrapU_V<sceUmdReplacePermit>,"sceUmdReplacePermit"},
-	{0x14c6c45c,0,"sceUmdUnuseUMDInMsUsbWlan"},
-	{0xb103fa38,0,"sceUmdUseUMDInMsUsbWlan"},
+	{0XC6183D47, &WrapI_UC<sceUmdActivate>,               "sceUmdActivate",               'i', "xs"},
+	{0X6B4A146C, &WrapU_V<sceUmdGetDriveStat>,            "sceUmdGetDriveStat",           'x', ""  },
+	{0X46EBB729, &WrapI_V<sceUmdCheckMedium>,             "sceUmdCheckMedium",            'i', ""  },
+	{0XE83742BA, &WrapI_UC<sceUmdDeactivate>,             "sceUmdDeactivate",             'i', "xs"},
+	{0X8EF08FCE, &WrapI_U<sceUmdWaitDriveStat>,           "sceUmdWaitDriveStat",          'i', "x" },
+	{0X56202973, &WrapI_UU<sceUmdWaitDriveStatWithTimer>, "sceUmdWaitDriveStatWithTimer", 'i', "xx"},
+	{0X4A9E5E29, &WrapI_UU<sceUmdWaitDriveStatCB>,        "sceUmdWaitDriveStatCB",        'i', "xx"},
+	{0X6AF9B50A, &WrapU_V<sceUmdCancelWaitDriveStat>,     "sceUmdCancelWaitDriveStat",    'x', ""  },
+	{0X20628E6F, &WrapU_V<sceUmdGetErrorStat>,            "sceUmdGetErrorStat",           'x', ""  },
+	{0X340B7686, &WrapU_U<sceUmdGetDiscInfo>,             "sceUmdGetDiscInfo",            'x', "x" },
+	{0XAEE7404D, &WrapU_U<sceUmdRegisterUMDCallBack>,     "sceUmdRegisterUMDCallBack",    'x', "x" },
+	{0XBD2BDE07, &WrapI_I<sceUmdUnRegisterUMDCallBack>,   "sceUmdUnRegisterUMDCallBack",  'i', "i" },
+	{0X87533940, &WrapU_V<sceUmdReplaceProhibit>,         "sceUmdReplaceProhibit",        'x', ""  },
+	{0XCBE9F02A, &WrapU_V<sceUmdReplacePermit>,           "sceUmdReplacePermit",          'x', ""  },
+	{0X14C6C45C, nullptr,                                 "sceUmdUnuseUMDInMsUsbWlan",    '?', ""  },
+	{0XB103FA38, nullptr,                                 "sceUmdUseUMDInMsUsbWlan",      '?', ""  },
 };
 
 void Register_sceUmdUser()

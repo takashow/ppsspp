@@ -15,21 +15,29 @@
 // Official git repository and contact information can be found at
 // https://github.com/hrydgard/ppsspp and http://www.ppsspp.org/.
 
+#include "ppsspp_config.h"
+#if PPSSPP_ARCH(X86) || PPSSPP_ARCH(AMD64)
+
 #include "Core/MemMap.h"
 #include "Core/MIPS/JitCommon/JitCommon.h"
 #include "Core/MIPS/x86/RegCache.h"
+#include "Core/MIPS/x86/Jit.h"
 
-static const u64 MEMORY_ALIGNED16(ssNoSignMask[2]) = {0x7FFFFFFF7FFFFFFFULL, 0x7FFFFFFF7FFFFFFFULL};
+alignas(16) static const u64 ssNoSignMask[2] = {0x7FFFFFFF7FFFFFFFULL, 0x7FFFFFFF7FFFFFFFULL};
 
 namespace MIPSComp {
+using namespace Gen;
 
 int Jit::Replace_fabsf() {
 	fpr.SpillLock(0, 12);
-	fpr.MapReg(0, MAP_DIRTY | MAP_NOINIT);
+	fpr.MapReg(0, false, true);
 	MOVSS(fpr.RX(0), fpr.R(12));
-	ANDPS(fpr.RX(0), M(&ssNoSignMask));
+	MOV(PTRBITS, R(RAX), ImmPtr(&ssNoSignMask));
+	ANDPS(fpr.RX(0), MatR(RAX));
 	fpr.ReleaseSpillLocks();
 	return 4;  // Number of instructions in the MIPS function
 }
 
 }
+
+#endif // PPSSPP_ARCH(X86) || PPSSPP_ARCH(AMD64)

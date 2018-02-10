@@ -18,7 +18,9 @@
 #include "i18n/i18n.h"
 #include "base/logging.h"
 #include "Common/ChunkFile.h"
+#include "Common/StringUtils.h"
 #include "Core/Config.h"
+#include "Core/Host.h"
 #include "Core/Reporting.h"
 #include "Core/System.h"
 #include "Core/Dialog/SavedataParam.h"
@@ -30,15 +32,10 @@
 #include "Core/ELF/ParamSFO.h"
 #include "Core/HW/MemoryStick.h"
 #include "Core/Util/PPGeDraw.h"
-#include "UI/OnScreenDisplay.h"
 
 #include "image/png_load.h"
 
 #include <algorithm>
-
-#ifdef BLACKBERRY
-using std::strnlen;
-#endif
 
 static const std::string ICON0_FILENAME = "ICON0.PNG";
 static const std::string ICON1_FILENAME = "ICON1.PMF";
@@ -59,8 +56,7 @@ namespace
 	void SetStringFromSFO(ParamSFOData &sfoFile, const char *name, char *str, int strLength)
 	{
 		std::string value = sfoFile.GetValueString(name);
-		strncpy(str, value.c_str(), strLength - 1);
-		str[strLength - 1] = 0;
+		truncate_cpy(str, strLength, value.c_str());
 	}
 
 	bool ReadPSPFile(std::string filename, u8 **data, s64 dataSize, s64 *readSize)
@@ -92,7 +88,7 @@ namespace
 		size_t result = pspFileSystem.WriteFile(handle, data, dataSize);
 		pspFileSystem.CloseFile(handle);
 
-		return result != 0;
+		return result == dataSize;
 	}
 
 	bool PSPMatch(std::string text, std::string regexp)
@@ -211,7 +207,7 @@ void SavedataParam::Init()
 		pspFileSystem.MkDir(savePath);
 	}
 	// Create a nomedia file to hide save icons form Android image viewer
-#ifdef ANDROID
+#ifdef __ANDROID__
 	int handle = pspFileSystem.OpenFile(savePath + ".nomedia", (FileAccess)(FILEACCESS_CREATE | FILEACCESS_WRITE), 0);
 	if (handle) {
 		pspFileSystem.CloseFile(handle);
@@ -369,8 +365,12 @@ bool SavedataParam::Save(SceUtilitySavedataParam* param, const std::string &save
 
 	std::string dirPath = GetSaveFilePath(param, GetSaveDir(param, saveDirName));
 
-	if (!pspFileSystem.GetFileInfo(dirPath).exists)
-		pspFileSystem.MkDir(dirPath);
+	if (!pspFileSystem.GetFileInfo(dirPath).exists) {
+		if (!pspFileSystem.MkDir(dirPath)) {
+			I18NCategory *err = GetI18NCategory("Error");
+			host->NotifyUserMessage(err->T("Unable to write savedata, disk may be full"));
+		}
+	}
 
 	u8* cryptedData = 0;
 	int cryptedSize = 0;
@@ -392,6 +392,8 @@ bool SavedataParam::Save(SceUtilitySavedataParam* param, const std::string &save
 		int decryptMode = DetermineCryptMode(param);
 		if (EncryptData(decryptMode, cryptedData, &cryptedSize, &aligned_len, cryptedHash, (HasKey(param) ? param->key : 0)) != 0)
 		{
+			I18NCategory *err = GetI18NCategory("Error");
+			host->NotifyUserMessage(err->T("Save encryption failed. This save won't work on real PSP"), 6.0f);
 			ERROR_LOG(SCEUTILITY,"Save encryption failed. This save won't work on real PSP");
 			delete[] cryptedData;
 			cryptedData = 0;
@@ -573,7 +575,7 @@ bool SavedataParam::Load(SceUtilitySavedataParam *param, const std::string &save
 	return true;
 }
 
-bool SavedataParam::LoadSaveData(SceUtilitySavedataParam *param, const std::string &saveDirName, const std::string dirPath, bool secureMode) {
+bool SavedataParam::LoadSaveData(SceUtilitySavedataParam *param, const std::string &saveDirName, const std::string& dirPath, bool secureMode) {
 	u8 *data_ = param->dataBuf;
 	std::string filePath = dirPath+"/"+GetFileName(param);
 	s64 readSize;
@@ -635,15 +637,21 @@ void SavedataParam::LoadCryptedSave(SceUtilitySavedataParam *param, u8 *data, u8
 
 			// Don't notify the user if we're not going to upgrade the save.
 			if (!g_Config.bEncryptSave) {
-				I18NCategory *d = GetI18NCategory("Dialog");
-				osm.Show(d->T("When you save, it will load on a PSP, but not an older PPSSPP"), 6.0f);
-				osm.Show(d->T("Old savedata detected"), 6.0f);
+				I18NCategory *di = GetI18NCategory("Dialog");
+				host->NotifyUserMessage(di->T("When you save, it will load on a PSP, but not an older PPSSPP"), 6.0f);
+				host->NotifyUserMessage(di->T("Old savedata detected"), 6.0f);
 			}
 		} else {
 			if (decryptMode == 5 && prevCryptMode == 3) {
 				WARN_LOG(SCEUTILITY, "Savedata loading with detected hashmode %d instead of file's %d", decryptMode, prevCryptMode);
 			} else {
 				WARN_LOG_REPORT(SCEUTILITY, "Savedata loading with detected hashmode %d instead of file's %d", decryptMode, prevCryptMode);
+			}
+			if (g_Config.bSavedataUpgrade) {
+				decryptMode = prevCryptMode;
+				I18NCategory *di = GetI18NCategory("Dialog");
+				host->NotifyUserMessage(di->T("When you save, it will not work on outdated PSP Firmware anymore"), 6.0f);
+				host->NotifyUserMessage(di->T("Old savedata detected"), 6.0f);
 			}
 		}
 	}
@@ -662,7 +670,7 @@ void SavedataParam::LoadNotCryptedSave(SceUtilitySavedataParam *param, u8 *data,
 		memcpy(data, saveData, std::min((u32)saveSize, (u32)param->dataBufSize));
 }
 
-void SavedataParam::LoadSFO(SceUtilitySavedataParam *param, const std::string dirPath) {
+void SavedataParam::LoadSFO(SceUtilitySavedataParam *param, const std::string& dirPath) {
 	ParamSFOData sfoFile;
 	std::string sfopath = dirPath+"/" + SFO_FILENAME;
 	PSPFileInfo sfoInfo = pspFileSystem.GetFileInfo(sfopath);
@@ -714,7 +722,7 @@ std::set<std::string> SavedataParam::getSecureFileNames(std::string dirPath) {
 	return secureFileNames;
 }
 
-void SavedataParam::LoadFile(const std::string dirPath, const std::string filename, PspUtilitySavedataFileData *fileData) {
+void SavedataParam::LoadFile(const std::string& dirPath, const std::string& filename, PspUtilitySavedataFileData *fileData) {
 	std::string filePath = dirPath + "/" + filename;
 	s64 readSize = -1;
 	if(!fileData->buf.IsValid())
@@ -895,34 +903,26 @@ int SavedataParam::BuildHash(unsigned char *output,
 	return 0;
 }
 
-std::string SavedataParam::GetSpaceText(int size)
+std::string SavedataParam::GetSpaceText(u64 size, bool roundUp)
 {
+	static const char *suffixes[] = {"B", "KB", "MB", "GB"};
 	char text[50];
 
-	if(size < 1024)
+	for (size_t i = 0; i < ARRAY_SIZE(suffixes); ++i)
 	{
-		sprintf(text,"%d B",size);
-		return std::string(text);
+		if (size < 1024)
+		{
+			snprintf(text, sizeof(text), "%lld %s", size, suffixes[i]);
+			return std::string(text);
+		}
+		if (roundUp) {
+			size = (size + 1023) / 1024;
+		} else {
+			size /= 1024;
+		}
 	}
 
-	size /= 1024;
-
-	if(size < 1024)
-	{
-		sprintf(text,"%d KB",size);
-		return std::string(text);
-	}
-
-	size /= 1024;
-
-	if(size < 1024)
-	{
-		sprintf(text,"%d MB",size);
-		return std::string(text);
-	}
-
-	size /= 1024;
-	sprintf(text,"%d GB",size);
+	snprintf(text, sizeof(text), "%llu TB", size);
 	return std::string(text);
 }
 
@@ -936,10 +936,11 @@ int SavedataParam::GetSizes(SceUtilitySavedataParam *param)
 
 	if (param->msFree.IsValid())
 	{
+		const u64 freeBytes = MemoryStick_FreeSpace();
 		param->msFree->clusterSize = (u32)MemoryStick_SectorSize();
-		param->msFree->freeClusters = (u32)(MemoryStick_FreeSpace() / MemoryStick_SectorSize());
-		param->msFree->freeSpaceKB = (u32)(MemoryStick_FreeSpace() / 0x400);
-		const std::string spaceTxt = SavedataParam::GetSpaceText((int)MemoryStick_FreeSpace());
+		param->msFree->freeClusters = (u32)(freeBytes / MemoryStick_SectorSize());
+		param->msFree->freeSpaceKB = (u32)(freeBytes / 0x400);
+		const std::string spaceTxt = SavedataParam::GetSpaceText(freeBytes, false);
 		memset(param->msFree->freeSpaceStr, 0, sizeof(param->msFree->freeSpaceStr));
 		strncpy(param->msFree->freeSpaceStr, spaceTxt.c_str(), sizeof(param->msFree->freeSpaceStr));
 	}
@@ -962,7 +963,7 @@ int SavedataParam::GetSizes(SceUtilitySavedataParam *param)
 			// Fieldrunners expects 736 KB, even though the files add up to ~600 KB.
 			int total_size = param->msData->info.usedClusters * (u32)MemoryStick_SectorSize();
 			param->msData->info.usedSpaceKB = total_size / 0x400;
-			std::string spaceTxt = SavedataParam::GetSpaceText(total_size);
+			std::string spaceTxt = SavedataParam::GetSpaceText(total_size, true);
 			strncpy(param->msData->info.usedSpaceStr, spaceTxt.c_str(), sizeof(param->msData->info.usedSpaceStr));
 
 			// TODO: What does this mean, then?  Seems to be the same.
@@ -982,8 +983,21 @@ int SavedataParam::GetSizes(SceUtilitySavedataParam *param)
 	if (param->utilityData.IsValid())
 	{
 		int total_size = 0;
-		total_size += getSizeNormalized(1); // SFO;
-		total_size += getSizeNormalized((u32)param->dataSize == 0 ? 1 : (u32)param->dataSize); // Save Data
+
+		// The directory record itself.
+		// TODO: Account for number of files / actual record size?
+		total_size += getSizeNormalized(1);
+		// Account for the SFO (is this always 1 sector?)
+		total_size += getSizeNormalized(1);
+		// Add the size of the data itself (don't forget encryption overhead.)
+		// This is only added if a filename is specified.
+		if (param->fileName[0] != 0) {
+			if (g_Config.bEncryptSave) {
+				total_size += getSizeNormalized((u32)param->dataSize + 16);
+			} else {
+				total_size += getSizeNormalized((u32)param->dataSize);
+			}
+		}
 		total_size += getSizeNormalized(param->icon0FileData.size);
 		total_size += getSizeNormalized(param->icon1FileData.size);
 		total_size += getSizeNormalized(param->pic1FileData.size);
@@ -991,13 +1005,13 @@ int SavedataParam::GetSizes(SceUtilitySavedataParam *param)
 
 		param->utilityData->usedClusters = total_size / (u32)MemoryStick_SectorSize();
 		param->utilityData->usedSpaceKB = total_size / 0x400;
-		std::string spaceTxt = SavedataParam::GetSpaceText(total_size);
+		std::string spaceTxt = SavedataParam::GetSpaceText(total_size, true);
 		memset(param->utilityData->usedSpaceStr, 0, sizeof(param->utilityData->usedSpaceStr));
 		strncpy(param->utilityData->usedSpaceStr, spaceTxt.c_str(), sizeof(param->utilityData->usedSpaceStr));
 
 		// TODO: Maybe these are rounded to the nearest 32KB?  Or something?
 		param->utilityData->usedSpace32KB = total_size / 0x400;
-		spaceTxt = SavedataParam::GetSpaceText(total_size);
+		spaceTxt = SavedataParam::GetSpaceText(total_size, true);
 		memset(param->utilityData->usedSpace32Str, 0, sizeof(param->utilityData->usedSpace32Str));
 		strncpy(param->utilityData->usedSpace32Str, spaceTxt.c_str(), sizeof(param->utilityData->usedSpace32Str));
 	}
@@ -1178,28 +1192,62 @@ bool SavedataParam::GetSize(SceUtilitySavedataParam *param)
 		return false;
 	}
 
-	std::string saveDir = savePath + GetGameName(param) + GetSaveName(param);
+	const std::string saveDir = savePath + GetGameName(param) + GetSaveName(param);
 	PSPFileInfo info = pspFileSystem.GetFileInfo(saveDir);
 	bool exists = info.exists;
 
 	if (param->sizeInfo.IsValid())
 	{
-		// TODO: Read the entries and count up the size vs. existing size?
+		const u64 freeBytes = MemoryStick_FreeSpace();
+
+		s64 overwriteBytes = 0;
+		s64 writeBytes = 0;
+		for (int i = 0; i < param->sizeInfo->numNormalEntries; ++i) {
+			const auto &entry = param->sizeInfo->normalEntries[i];
+			overwriteBytes += pspFileSystem.GetFileInfo(saveDir + "/" + entry.name).size;
+			writeBytes += entry.size;
+		}
+		for (int i = 0; i < param->sizeInfo->numSecureEntries; ++i) {
+			const auto &entry = param->sizeInfo->secureEntries[i];
+			overwriteBytes += pspFileSystem.GetFileInfo(saveDir + "/" + entry.name).size;
+			writeBytes += entry.size + 0x10;
+		}
 
 		param->sizeInfo->sectorSize = (int)MemoryStick_SectorSize();
-		param->sizeInfo->freeSectors = (int)(MemoryStick_FreeSpace() / MemoryStick_SectorSize());
+		param->sizeInfo->freeSectors = (int)(freeBytes / MemoryStick_SectorSize());
 
-		// TODO: Is this after the specified files?  Before?
-		param->sizeInfo->freeKB = (int)(MemoryStick_FreeSpace() / 1024);
-		std::string spaceTxt = SavedataParam::GetSpaceText((int)MemoryStick_FreeSpace());
-		strncpy(param->sizeInfo->freeString, spaceTxt.c_str(), 8);
-		param->sizeInfo->freeString[7] = '\0';
+		// TODO: Is this after the specified files?  Probably before?
+		param->sizeInfo->freeKB = (int)(freeBytes / 1024);
+		std::string spaceTxt = SavedataParam::GetSpaceText(freeBytes, false);
+		truncate_cpy(param->sizeInfo->freeString, spaceTxt.c_str());
 
-		// TODO.
-		param->sizeInfo->neededKB = 0;
-		strcpy(param->sizeInfo->neededString, "0 KB");
-		param->sizeInfo->overwriteKB = 0;
-		strcpy(param->sizeInfo->overwriteString, "0 KB");
+		if (writeBytes - overwriteBytes < (s64)freeBytes) {
+			param->sizeInfo->neededKB = 0;
+
+			// Note: this is "needed to overwrite".
+			param->sizeInfo->overwriteKB = 0;
+
+			spaceTxt = GetSpaceText(0, true);
+			truncate_cpy(param->sizeInfo->neededString, spaceTxt.c_str());
+			truncate_cpy(param->sizeInfo->overwriteString, spaceTxt.c_str());
+		} else {
+			// Bytes needed to save additional data.
+			s64 neededBytes = writeBytes - freeBytes;
+			param->sizeInfo->neededKB = (neededBytes + 1023) / 1024;
+			spaceTxt = GetSpaceText(neededBytes, true);
+			truncate_cpy(param->sizeInfo->neededString, spaceTxt.c_str());
+
+			if (writeBytes - overwriteBytes < (s64)freeBytes) {
+				param->sizeInfo->overwriteKB = 0;
+				spaceTxt = GetSpaceText(0, true);
+				truncate_cpy(param->sizeInfo->overwriteString, spaceTxt.c_str());
+			} else {
+				s64 neededOverwriteBytes = writeBytes - freeBytes - overwriteBytes;
+				param->sizeInfo->overwriteKB = (neededOverwriteBytes + 1023) / 1024;
+				spaceTxt = GetSpaceText(neededOverwriteBytes, true);
+				truncate_cpy(param->sizeInfo->overwriteString, spaceTxt.c_str());
+			}
+		}
 	}
 
 	return exists;
@@ -1277,8 +1325,8 @@ int SavedataParam::SetPspParam(SceUtilitySavedataParam *param)
 					std::string gameName = GetGameName(param);
 					std::string saveName = "";
 					for(auto it = allSaves.begin(); it != allSaves.end(); ++it) {
-						if(strncmp(it->name.c_str(),gameName.c_str(),strlen(gameName.c_str())) == 0) {
-							saveName = it->name.substr(strlen(gameName.c_str()));						
+						if(it->name.compare(0, gameName.length(), gameName) == 0) {
+							saveName = it->name.substr(gameName.length());
 							
 							if(IsInSaveDataList(saveName, realCount)) // Already in SaveDataList, skip...
 								continue;
@@ -1408,8 +1456,7 @@ void SavedataParam::SetFileInfo(int idx, PSPFileInfo &info, std::string saveName
 	saveDataList[idx].idx = idx;
 }
 
-void SavedataParam::ClearFileInfo(SaveFileInfo &saveInfo, std::string saveName)
-{
+void SavedataParam::ClearFileInfo(SaveFileInfo &saveInfo, const std::string &saveName) {
 	saveInfo.size = 0;
 	saveInfo.saveName = saveName;
 	saveInfo.idx = 0;
@@ -1420,16 +1467,17 @@ void SavedataParam::ClearFileInfo(SaveFileInfo &saveInfo, std::string saveName)
 		saveInfo.texture = NULL;
 	}
 
-	if (GetPspParam()->newData.IsValid() && GetPspParam()->newData->buf.IsValid())
-	{
+	if (GetPspParam()->newData.IsValid() && GetPspParam()->newData->buf.IsValid()) {
 		// We have a png to show
-		if (!noSaveIcon)
-		{
+		if (!noSaveIcon) {
 			noSaveIcon = new SaveFileInfo();
 			PspUtilitySavedataFileData *newData = GetPspParam()->newData;
 			noSaveIcon->texture = new PPGeImage(newData->buf.ptr, (SceSize)newData->size);
 		}
 		saveInfo.texture = noSaveIcon->texture;
+	} else if ((u32)GetPspParam()->mode == SCE_UTILITY_SAVEDATA_TYPE_SAVE && GetPspParam()->icon0FileData.buf.IsValid()) {
+		const PspUtilitySavedataFileData &icon0FileData = GetPspParam()->icon0FileData;
+		saveInfo.texture = new PPGeImage(icon0FileData.buf.ptr, (SceSize)icon0FileData.size);
 	}
 }
 

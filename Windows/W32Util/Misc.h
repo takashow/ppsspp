@@ -34,10 +34,7 @@ struct GenericListViewDef
 // the most significant bit states whether the key is currently down.
 // simply checking if it's != 0 is not enough, as bit0 is set if
 // the key was pressed between the last call to GetAsyncKeyState
-inline bool KeyDownAsync(int vkey)
-{
-	return (GetAsyncKeyState(vkey) & 0x8000) != 0;
-}
+bool KeyDownAsync(int vkey);
 
 class GenericListControl
 {

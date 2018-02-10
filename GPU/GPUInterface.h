@@ -19,11 +19,16 @@
 
 #include <list>
 #include <string>
+#include <vector>
 
-#include "GPU/GPUState.h"
+#include "Common/Swap.h"
+#include "GPU/GPU.h"
 #include "Core/MemMap.h"
+#include "GPU/ge_constants.h"
+#include "GPU/Common/ShaderCommon.h"
 
 struct PspGeListArgs;
+struct GPUgstate;
 class PointerWrap;
 
 enum DisplayListStatus {
@@ -52,8 +57,7 @@ enum DisplayListState {
   PSP_GE_DL_STATE_PAUSED = 4,
 };
 
-enum SignalBehavior
-{
+enum SignalBehavior {
 	PSP_GE_SIGNAL_NONE             = 0x00,
 	PSP_GE_SIGNAL_HANDLER_SUSPEND  = 0x01,
 	PSP_GE_SIGNAL_HANDLER_CONTINUE = 0x02,
@@ -89,8 +93,7 @@ enum SignalBehavior
 	PSP_GE_SIGNAL_BREAK2           = 0xFF,
 };
 
-enum GPUState
-{
+enum GPURunState {
 	GPUSTATE_RUNNING = 0,
 	GPUSTATE_DONE = 1,
 	GPUSTATE_STALL = 2,
@@ -98,15 +101,13 @@ enum GPUState
 	GPUSTATE_ERROR = 4,
 };
 
-enum GPUSyncType
-{
+enum GPUSyncType {
 	GPU_SYNC_DRAW,
 	GPU_SYNC_LIST,
 };
 
 // Used for debug
-struct FramebufferInfo
-{
+struct FramebufferInfo {
 	u32 fb_address;
 	u32 z_address;
 	int format;
@@ -115,15 +116,13 @@ struct FramebufferInfo
 	void* fbo;
 };
 
-struct DisplayListStackEntry
-{
+struct DisplayListStackEntry {
 	u32 pc;
 	u32 offsetAddr;
 	u32 baseAddr;
 };
 
-struct DisplayList
-{
+struct DisplayList {
 	int id;
 	u32 startpc;
 	u32 pc;
@@ -143,6 +142,8 @@ struct DisplayList
 	u32 offsetAddr;
 	bool bboxResult;
 	u32 stackAddr;
+
+	u32 padding;  // Android x86-32 does not round the structure size up to the closest multiple of 8 like the other platforms.
 };
 
 enum GPUInvalidationType {
@@ -154,55 +155,9 @@ enum GPUInvalidationType {
 	GPU_INVALIDATE_SAFE,
 };
 
-enum GPUEventType {
-	GPU_EVENT_INVALID,
-	GPU_EVENT_PROCESS_QUEUE,
-	GPU_EVENT_INIT_CLEAR,
-	GPU_EVENT_BEGIN_FRAME,
-	GPU_EVENT_COPY_DISPLAY_TO_OUTPUT,
-	GPU_EVENT_REAPPLY_GFX_STATE,
-	GPU_EVENT_INVALIDATE_CACHE,
-	GPU_EVENT_FINISH_EVENT_LOOP,
-	GPU_EVENT_SYNC_THREAD,
-	GPU_EVENT_FB_MEMCPY,
-	GPU_EVENT_FB_MEMSET,
-	GPU_EVENT_FB_STENCIL_UPLOAD,
-	GPU_EVENT_REINITIALIZE,
-};
-
-struct GPUEvent {
-	GPUEvent(GPUEventType t) : type(t) {}
-	GPUEventType type;
-	union {
-		// GPU_EVENT_INVALIDATE_CACHE
-		struct {
-			u32 addr;
-			int size;
-			GPUInvalidationType type;
-		} invalidate_cache;
-		// GPU_EVENT_FB_MEMCPY
-		struct {
-			u32 dst;
-			u32 src;
-			int size;
-		} fb_memcpy;
-		// GPU_EVENT_FB_MEMSET
-		struct {
-			u32 dst;
-			u8 v;
-			int size;
-		} fb_memset;
-		// GPU_EVENT_FB_STENCIL_UPLOAD
-		struct {
-			u32 dst;
-			int size;
-		} fb_stencil_upload;
-	};
-
-	operator GPUEventType() const {
-		return type;
-	}
-};
+namespace Draw {
+class DrawContext;
+}
 
 class GPUInterface {
 public:
@@ -210,12 +165,16 @@ public:
 
 	static const int DisplayListMaxCount = 64;
 
+	virtual Draw::DrawContext *GetDrawContext() = 0;
+
 	// Initialization
+	virtual bool IsReady() = 0;
 	virtual void InitClear() = 0;
 	virtual void Reinitialize() = 0;
 
-	virtual void RunEventsUntil(u64 globalticks) = 0;
-	virtual void FinishEventLoop() = 0;
+	// Frame managment
+	virtual void BeginHostFrame() = 0;
+	virtual void EndHostFrame() = 0;
 
 	// Draw queue management
 	virtual DisplayList* getList(int listid) = 0;
@@ -243,11 +202,12 @@ public:
 	virtual void CopyDisplayToOutput() = 0;
 
 	// Tells the GPU to update the gpuStats structure.
-	virtual void UpdateStats() = 0;
+	virtual void GetStats(char *buffer, size_t bufsize) = 0;
 
 	// Invalidate any cached content sourced from the specified range.
 	// If size = -1, invalidate everything.
 	virtual void InvalidateCache(u32 addr, int size, GPUInvalidationType type) = 0;
+	virtual void NotifyVideoUpload(u32 addr, int size, int width, int format) = 0;
 	// Update either RAM from VRAM, or VRAM from RAM... or even VRAM from VRAM.
 	virtual bool PerformMemoryCopy(u32 dest, u32 src, int size) = 0;
 	virtual bool PerformMemorySet(u32 dest, u8 v, int size) = 0;
@@ -262,10 +222,8 @@ public:
 	virtual void EnableInterrupts(bool enable) = 0;
 
 	virtual void DeviceLost() = 0;
+	virtual void DeviceRestore() = 0;
 	virtual void ReapplyGfxState() = 0;
-	virtual void SyncThread(bool force = false) = 0;
-	virtual void SyncBeginFrame() = 0;
-	virtual u64  GetTickEstimate() = 0;
 	virtual void DoState(PointerWrap &p) = 0;
 
 	// Called by the window system if the window size changed. This will be reflected in PSPCoreParam.pixel*.
@@ -283,6 +241,11 @@ public:
 	virtual void DumpNextFrame() = 0;
 	virtual void GetReportingInfo(std::string &primaryInfo, std::string &fullInfo) = 0;
 	virtual const std::list<int>& GetDisplayLists() = 0;
-	virtual bool DecodeTexture(u8* dest, GPUgstate state) = 0;
+	virtual bool DecodeTexture(u8* dest, const GPUgstate &state) = 0;
 	virtual std::vector<FramebufferInfo> GetFramebufferList() = 0;
+	virtual s64 GetListTicks(int listid) = 0;
+
+	// For debugging. The IDs returned are opaque, do not poke in them or display them in any way.
+	virtual std::vector<std::string> DebugGetShaderIDs(DebugShaderType type) = 0;
+	virtual std::string DebugGetShaderString(std::string id, DebugShaderType type, DebugShaderStringType stringType) = 0;
 };
